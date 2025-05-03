@@ -3,14 +3,16 @@ from __future__ import annotations
 import time
 import math
 import random
-from typing import List, Tuple, Any, Dict, Optional
 import numpy as np
 from dataclasses import dataclass
+from typing import List, Tuple, Any, Dict, Optional, Union
 from torch import nn
 import numba
-
+from tqdm import tqdm
+import os
 from game_alt import GameRules, GameState, BoardType
 from model import ZeroNetwork
+import torch
 
 __all__ = [
     "ZeroModel",
@@ -33,27 +35,39 @@ class ZeroModel:
     ACTIONS = 4  # up, right, down, left
 
     def __init__(self, n=4, m=4, k=20, filters=FILTERS, blocks=BLOCKS, model = None):
-        pass
+        if model is None:
+            self.model = ZeroNetwork(n, m, k, filters, blocks)
 
     def infer(self, board: BoardType) -> ZeroProbs:
         # *** Replace this with real NN inference ***
         priors = [1.0 / self.ACTIONS] * self.ACTIONS  # uniform policy
-        import ipdb; ipdb.set_trace()
         # simple heuristic value: log2(max_tile)/11 ∈ [0,1]; scale to [-1,1]
         max_tile = board.max(initial=0)
         value = math.log2(max_tile + 1) / 11.0 * 2 - 1
         return priors, float(value)
 
 @numba.njit(cache=True)
-def to_one_hot(board: BoardType, k: int) -> np.ndarray:
-    n, m = board.shape
-    one_hot = np.zeros((1, k, m, n), dtype=np.float16)
+def to_one_hot_inplace(board: BoardType, result:np.ndarray, index, n, m, k:int) -> None:
     for i in range(n):
         for j in range(m):
-            if board[i,j] > 0:
-                one_hot[0,board[i,j], i,j] = 1.0
-    return one_hot
+            tile_value = board[i, j]
+            if tile_value > 0:
+                index = int(tile_value).bit_length() - 1
+                if 1 <= index < k:
+                    result[index, index, i, j] = 1.0
+                pass
 
+@numba.njit(cache=True)
+def to_one_hot(board: Union[BoardType, List[BoardType]], k: int) -> np.ndarray:
+    n, m = board.shape # n = height (rows), m = width (cols)
+    # Standard shape: (batch, channels, height, width)
+    if isinstance(board, BoardType):
+        board = [board]
+    one_hot = np.zeros((len(board), k, n, m), dtype=np.float16)
+    for i, b in enumerate(board):
+        # one-hot encoding
+        to_one_hot_inplace(b, one_hot[i], 0, n, m, k)
+    return one_hot
 class ZeroModelNN(ZeroModel):
     """Policy‑Value network interface.
 
@@ -70,13 +84,29 @@ class ZeroModelNN(ZeroModel):
     def eval(self):
         self.model.eval()
 
+    def set_model(self, model: nn.Module):
+        self.model = model
+
+    def save(self, path = None):
+        if path is None:
+            path = "model.pth"
+        self.model.save(path)
+
     def infer(self, board: BoardType) -> ZeroProbs:
         # convert board into one-hot encoding, where board is currently nxm with value in each square
         # should be 1xnxmxk with k=20 (max tile) with a 1 in the square of the value, else 0
         model_input = to_one_hot(board, 20)
-
-
-
+        # convert to tensor
+        model_input = torch.from_numpy(model_input).float()
+        # run through model
+        with torch.no_grad():
+            priors, value = self.model(model_input)
+        # convert to numpy
+        priors = priors.numpy()[0]
+        value = value.numpy()[0]
+        # convert to list
+        priors = priors.tolist()
+        return priors, float(value)
 
 
 C_PUCT = math.sqrt(2)  # exploration constant (tune later)
@@ -157,7 +187,7 @@ class ZeroMCTSNode:
 
     def expand_chance_child(self) -> Tuple[Any, "ZeroMCTSNode"]:
         assert self.type == self.CHANCE
-        new_board, [action_tuple] = self.rules.add_random_tiles(self.state.board, return_action=True)
+        new_board, action_tuple = self.rules.add_random_tiles(self.state.board, return_action=True)
         child_state = GameState(new_board, self.state.score)
         child = ZeroMCTSNode(self.PLAYER, self.model, self.rules, child_state, parent=self)
 
@@ -198,15 +228,15 @@ class ZeroPlayer:
         root = ZeroMCTSNode(ZeroMCTSNode.PLAYER, self.model, self.rules, state)
         self._add_dirichlet_noise(root)
 
-        deadline = time.time() + time_limit
+        deadline = time.time() + time_limit+2
         sims_done = 0
+        x =time.time() < deadline
         while (simulations is None and time.time() < deadline) or (simulations is not None and sims_done < simulations):
             leaf, path = self._tree_search(root)
             leaf_value = self._evaluate_leaf(leaf)
             self._backprop(path, leaf_value)
             sims_done += 1
 
-        print("sims done:", sims_done)
         # pick action with highest visit count
         best_action = max(root.children.items(), key=lambda kv: kv[1].visits)[0]
         # retrieve probabilities and value
@@ -249,29 +279,62 @@ class ZeroPlayer:
             n.value_sum += leaf_value
             # no sign flip – single player
 
-import torch
-
-
 class ZeroTrainer:
-    def __init__(self, model: ZeroModel, rules: GameRules, player: Optional[ZeroPlayer] = None):
+    def __init__(self, model: ZeroModelNN, rules: GameRules, player: Optional[ZeroPlayer] = None):
         self.model = model
         self.rules = rules
         self.player = ZeroPlayer(model, rules) if player is None else player
 
     def train(self, epochs: int, batch_size: int, **kwargs):
-        for i in range(epochs):
+        # if os.path.exists("checkpoints/model.pth"):
+        #     self.model.load("checkpoints/model.pth")
+        #
+        if not os.path.exists("checkpoints"):
+            os.makedirs("checkpoints")
+        model = self.model.model
+        model.train()
+        optimizer = torch.optim.SGD(self.model.model.parameters(), lr=0.01, momentum=0.9)
+        for epoch in tqdm(range(epochs)):
             samples = []
-            for batch in range(batch_size):
+            for _ in range(batch_size):
                 state = self.rules.get_initial_state()
-                while not self.rules.is_terminal(state.board):
-                    action, data = self.player.play(state, **kwargs)
-                    samples.append((state, action, data))
-                    new_board, score_gain = self.rules.apply_move(state.board, action)
-                    new_board = self.rules.add_random_tiles(new_board)[0]
-                    state = GameState(new_board, state.score + score_gain)
-            # Update model with samples
-            self.model.update(samples)
+                trajectory = []
 
+                # play until terminal
+                while not self.rules.is_terminal(state.board):
+                    action, (pi_probs, _value_est) = self.player.play(state, simulations=10000)
+                    trajectory.append((state, pi_probs))
+                    new_board, gain = self.rules.apply_move(state.board, action)
+                    new_board = self.rules.add_random_tiles(new_board)
+                    state = GameState(new_board, state.score + gain)
+
+                max_tile = self.rules.get_max_tile(state.board)
+                z = math.log2(int(max_tile) + 1) / 11.0 * 2 - 1  # scaled into [-1,1]
+                print("max tile:", max_tile, "z:", z)
+
+                for (s_t, pi_t) in trajectory:
+                    samples.append((s_t, pi_t, z))
+
+            states, pis, zs = zip(*samples)
+            boards = [to_one_hot(state.board, 20)[0] for state in states]
+            state_tensor = torch.tensor(np.stack(boards), dtype=torch.float32)
+
+            pi_tensor = torch.tensor(pis, dtype=torch.float32) # N x 4
+
+            z_tensor = torch.tensor(zs, dtype=torch.float32).unsqueeze(1) # N x 1
+
+            optimizer.zero_grad()
+            p_pred, v_pred = model(state_tensor)
+            policy_loss = -(pi_tensor * torch.log(p_pred + 1e-8)).sum(dim=1).mean()
+            value_loss = torch.nn.functional.mse_loss(v_pred, z_tensor)
+            loss = policy_loss + value_loss
+            loss.backward()
+            optimizer.step()
+
+            print(f"Epoch {epoch}: loss={loss.item():.4f} (π:{policy_loss:.4f}, v:{value_loss:.4f})")
+
+            if epoch % 10 == 0:
+                self.model.save(f"checkpoints/model_epoch_{epoch}.pth")
 
 
 
