@@ -93,13 +93,55 @@ class Simplified2048:
                    - total_score (int): The total score after the move.
                    Returns (0, current_score) if the move is invalid or game is over.
         """
-        if self._game_over:
+        # Use simulate_move to get the results without committing
+        board_changed, score_gain, new_total_score, new_board = self.simulate_move(direction)
+
+        # If the board changed, commit the changes
+        if board_changed:
+            # Update the board and score
+            self._board = new_board
+            self._score = new_total_score
+
+            # Add the configured number of tiles
+            # self.generate_tiles()
+
+            # Check for game over
+            if not self._check_if_any_moves_possible():
+                self._game_over = True
+
+            return score_gain, self._score
+        else:
+            # Board didn't change, but check if game is over anyway
+            if not self._check_if_any_moves_possible():
+                self._game_over = True
             return np.int64(0), self._score
 
-        assert 0 <=direction and direction <= 3, "Invalid direction. Use 0 (Up), 1 (Right), 2 (Down), or 3 (Left)."
+    def simulate_move(self, direction: int) -> Tuple[bool, np.int64, np.int64, BoardType]:
+        """
+        Simulates a move in the given direction without altering the game state.
+        Returns the results of the move without committing changes.
+
+        Args:
+            direction (int): 0: Up, 1: Right, 2: Down, 3: Left.
+
+        Returns:
+            tuple: (board_changed, score_gain, total_score_after, new_board)
+                - board_changed (bool): Whether the move would change the board
+                - score_gain (np.int64): Score that would be added by this move
+                - total_score_after (np.int64): What the total score would be after the move
+                - new_board (BoardType): The resulting board state after the move
+
+        Note:
+            This does NOT generate new tiles or update game state.
+            Useful for AI planning and simulations.
+        """
+        if self._game_over:
+            return False, np.int64(0), self._score, self._board.copy()
+
+        assert 0 <= direction <= 3, "Invalid direction. Use 0 (Up), 1 (Right), 2 (Down), or 3 (Left)."
 
         original_board: BoardType = self._board.copy()
-        new_board: BoardType = self._board.copy() # Start with current state
+        new_board: BoardType = self._board.copy()  # Start with current state
         total_score_gain: np.int64 = np.int64(0)
 
         # --- Execute Move Logic (No Rotation) ---
@@ -121,24 +163,9 @@ class Simplified2048:
         # --- End Move Logic ---
 
         board_changed: bool = not np.array_equal(original_board, new_board)
+        new_total_score = self._score + total_score_gain if board_changed else self._score
 
-        if board_changed:
-            self._board = new_board # Commit the changes
-            self._score += total_score_gain
-
-            # Add the configured number of tiles
-            # self.generate_tiles()
-
-            # Check for game over *after* attempting to add all tiles
-            if not self._check_if_any_moves_possible():
-                self._game_over = True
-
-            return total_score_gain, self._score
-        else:
-            # Board didn't change, but check if game is over anyway
-            if not self._check_if_any_moves_possible():
-                self._game_over = True
-            return np.int64(0), self._score
+        return board_changed, total_score_gain, new_total_score, new_board
 
     def generate_tiles(self) -> bool:
         """
