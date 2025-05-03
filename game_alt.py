@@ -1,209 +1,246 @@
 import numpy as np
 import random
 import copy
-from typing import Dict, List, Tuple, Optional, Any
+import numba
+from typing import Dict, List, Tuple, Optional, Any, NamedTuple, Union
 
-# Define a type alias for the board for clarity
 BoardType = np.ndarray[Any, np.dtype[np.int64]]
 
-class Simplified2048:
-    """
-    A simplified, programmatic-only version of the 2048 game with
-    customizable dimensions, spawn rates, and number of tiles spawned per move.
-    Designed for AI experiments like MCTS. No GUI.
-    Uses integer directions: 0: Up, 1: Right, 2: Down, 3: Left.
-    """
+class GameState(NamedTuple):
+    board: BoardType
+    score: np.int64
+
+@numba.njit(cache=True)
+def _process_line_numba(line: BoardType) -> Tuple[BoardType, np.int64]:
+    line_len = len(line)
+    new_line = np.zeros_like(line)
+    merge_score: np.int64 = np.int64(0)
+    write_idx: int = 0
+    last_merged: bool = False
+
+    read_idx = 0
+    processed_indices = -1
+    target_idx = 0
+
+    while read_idx < line_len:
+        val = line[read_idx]
+        if val == 0:
+            read_idx += 1
+            continue
+
+        if target_idx > 0 and new_line[target_idx - 1] == val and not last_merged:
+            merged_val = val * 2
+            new_line[target_idx - 1] = merged_val
+            merge_score += merged_val
+            last_merged = True
+        else:
+            new_line[target_idx] = val
+            last_merged = False
+            target_idx += 1
+
+        read_idx += 1
+
+    return new_line, merge_score
+
+
+@numba.njit(cache=True)
+def _perform_move_logic_numba(board: BoardType, direction: int) -> Tuple[BoardType, np.int64]:
+    height, width = board.shape
+    new_board = board.copy()
+    total_score_gain: np.int64 = np.int64(0)
+    line_result: BoardType
+    gain: np.int64
+
+    if direction == 3: # Left
+        for r in range(height):
+            line = new_board[r, :]
+            processed_line, gain = _process_line_numba(line)
+            new_board[r, :] = processed_line
+            total_score_gain += gain
+    elif direction == 1: # Right
+        for r in range(height):
+            line = new_board[r, ::-1]
+            processed_line, gain = _process_line_numba(line)
+            new_board[r, :] = processed_line[::-1]
+            total_score_gain += gain
+    elif direction == 0: # Up
+        for c in range(width):
+            col = new_board[:, c].copy() # Need copy for Numba safety
+            processed_col, gain = _process_line_numba(col)
+            new_board[:, c] = processed_col
+            total_score_gain += gain
+    elif direction == 2: # Down
+        for c in range(width):
+            col = new_board[::-1, c].copy() # Need copy for Numba safety
+            processed_col, gain = _process_line_numba(col)
+            new_board[:, c] = processed_col[::-1]
+            total_score_gain += gain
+
+    return new_board, total_score_gain
+
+@numba.njit(cache=True)
+def _check_if_any_moves_possible_numba(board: BoardType) -> bool:
+    height, width = board.shape
+
+    if np.any(board == 0):
+       return True
+
+    for r in range(height):
+        for c in range(width - 1):
+            if board[r, c] != 0 and board[r, c] == board[r, c + 1]:
+                return True
+    for c in range(width):
+        for r in range(height - 1):
+             if board[r, c] != 0 and board[r, c] == board[r + 1, c]:
+                return True
+
+    return False
+
+@numba.njit(cache=True)
+def _add_random_tile_numba(board: BoardType, spawn_values: np.ndarray, spawn_weights: np.ndarray) -> Optional[Tuple[int, int, int]]:
+    empty_rows, empty_cols = np.where(board == 0)
+    num_empty = len(empty_rows)
+
+    if num_empty == 0:
+        return None
+
+    idx: int = random.randrange(num_empty)
+    r: int = empty_rows[idx]
+    c: int = empty_cols[idx]
+
+    # Numba doesn't support random.choices directly with weights
+    # Workaround using cumulative weights and random.random()
+    choice_idx = np.searchsorted(np.cumsum(spawn_weights), random.random(), side="right")
+    val = spawn_values[choice_idx]
+
+    return r, c, val
+
+
+class GameRules:
     UP: int = 0
     RIGHT: int = 1
     DOWN: int = 2
     LEFT: int = 3
     DIRECTIONS: List[int] = [UP, RIGHT, DOWN, LEFT]
     DEFAULT_SPAWN_RATES: Dict[int, float] = {2: 0.9, 4: 0.1}
+
     height: int
     width: int
     num_spawn_tiles_per_move: int
     num_initial_tiles: int
     _spawn_rates: Dict[int, float]
-    _spawn_values: List[int]
-    _spawn_weights: List[float]
-    _board: BoardType
-    _score: np.int64
-    _game_over: bool
+    _spawn_values_np: np.ndarray
+    _spawn_weights_np: np.ndarray
 
     def __init__(self,
                  height: int = 4,
                  width: int = 4,
                  spawn_rates: Dict[int, float] = DEFAULT_SPAWN_RATES,
-                 num_spawn_tiles_per_move: int= 2,
-                 num_initial_tiles:int= 2):
+                 num_spawn_tiles_per_move: int = 1,
+                 num_initial_tiles: int = 2):
+        assert height > 0 and width > 0
+        assert num_spawn_tiles_per_move > 0
+        assert num_initial_tiles >= 0
+        max_tiles = height * width
+        assert num_initial_tiles <= max_tiles
+        assert isinstance(spawn_rates, dict)
+        assert all(isinstance(k, int) and k > 0 for k in spawn_rates.keys())
+        assert np.isclose(sum(spawn_rates.values()), 1.0)
+
         self.height = height
         self.width = width
-        assert num_spawn_tiles_per_move > 0, "num_spawn_tiles_per_move must be positive."
-        assert num_initial_tiles > 0, "num_initial_tiles must be positive."
-        assert num_spawn_tiles_per_move <= self.height * self.width, "Cannot spawn more tiles than available spaces."
-        assert height > 0 and width > 0, "Board dimensions must be positive."
-        assert isinstance(spawn_rates, dict), "spawn_rates must be a dictionary."
-        assert np.isclose(sum(spawn_rates.values()), 1.0), "Spawn rate probabilities must sum to 1.0."
-
         self.num_spawn_tiles_per_move = num_spawn_tiles_per_move
         self.num_initial_tiles = num_initial_tiles
 
         self._spawn_rates = spawn_rates.copy()
-        self._spawn_values = list(self._spawn_rates.keys())
-        self._spawn_weights = list(self._spawn_rates.values())
+        # Store as numpy arrays for Numba compatibility
+        self._spawn_values_np = np.array(list(self._spawn_rates.keys()), dtype=np.int64)
+        self._spawn_weights_np = np.array(list(self._spawn_rates.values()), dtype=np.float64)
 
-        self._board = np.zeros((self.height, self.width), dtype=np.int64)
-        self._score = np.int64(0)
-        self._game_over = False
 
-        for _ in range(self.num_initial_tiles):
-            self._add_random_tile()
+    def get_initial_state(self) -> GameState:
+        board = np.zeros((self.height, self.width), dtype=np.int64)
+        score = np.int64(0)
+        max_tiles = self.height * self.width
+        actual_initial_tiles = min(self.num_initial_tiles, max_tiles)
 
-    # --- Core API ---
+        new_board = board
+        for _ in range(actual_initial_tiles):
+            # Directly call the tile adding logic without modifying instance state
+            spawn_result = _add_random_tile_numba(new_board, self._spawn_values_np, self._spawn_weights_np)
+            if spawn_result:
+                r, c, val = spawn_result
+                temp_board = new_board.copy() # Create copy before modification
+                temp_board[r, c] = val
+                new_board = temp_board # Update reference
+            else:
+                break # Should not happen with initial empty board if max_tiles respected
 
-    def get_board(self) -> BoardType:
-        """Returns a copy of the current board state (numpy array)."""
-        return self._board.copy()
+        return GameState(new_board, score)
 
-    def get_score(self) -> np.int64:
-        """Returns the current score."""
-        return self._score
+    def apply_move(self, board: BoardType, direction: int) -> Tuple[BoardType, np.int64]:
+        assert 0 <= direction <= 3
+        if board.dtype != np.int64:
+           board = board.astype(np.int64)
+        return _perform_move_logic_numba(board, direction)
 
-    def is_game_over(self) -> bool:
-        """Returns True if the game is over, False otherwise."""
-        if self._game_over:
-            return True
-        # Check lazily - only calculate if not already marked as over
-        if not self._check_if_any_moves_possible():
-            self._game_over = True
-            return True
-        return False
+    def simulate_move(self, board: BoardType, direction: int) -> Tuple[bool, np.int64, BoardType]:
+        assert 0 <= direction <= 3
+        if board.dtype != np.int64:
+           board = board.astype(np.int64)
 
-    def move(self, direction: int) -> Tuple[np.int64, np.int64]:
+        new_board, score_gain = _perform_move_logic_numba(board, direction)
+        board_changed: bool = np.any(board != new_board)
+        return board_changed, score_gain, new_board
+
+    def get_valid_moves(self, board: BoardType) -> List[int]:
+        valid_moves: List[int] = []
+        for direction in self.DIRECTIONS:
+            board_changed, _, _ = self.simulate_move(board, direction)
+            if board_changed:
+                valid_moves.append(direction)
+        return valid_moves
+
+    def is_terminal(self, board: BoardType) -> bool:
+        return not _check_if_any_moves_possible_numba(board)
+
+    def add_random_tiles(self, board: BoardType, return_action=False) -> Union[Tuple[BoardType, List[Tuple[int]]], BoardType]:
         """
-        Attempts to move tiles in the given direction. Adds
-        `num_spawn_tiles_per_move` new tiles if the board changed.
-
-        Args:
-            direction (int): 0: Up, 1: Right, 2: Down, 3: Left.
-
-        Returns:
-            tuple: (score_gain, total_score)
-                   - score_gain (int): Score added by this move (0 if no move).
-                   - total_score (int): The total score after the move.
-                   Returns (0, current_score) if the move is invalid or game is over.
+        Either returns a new board with random tiles added, or the new board and a list of actions taken.
+        :param board:
+        :param return_action:
+        :return:
         """
-        # Use simulate_move to get the results without committing
-        board_changed, score_gain, new_total_score, new_board = self.simulate_move(direction)
-
-        # If the board changed, commit the changes
-        if board_changed:
-            # Update the board and score
-            self._board = new_board
-            self._score = new_total_score
-
-            # Add the configured number of tiles
-            # self.generate_tiles()
-
-            # Check for game over
-            if not self._check_if_any_moves_possible():
-                self._game_over = True
-
-            return score_gain, self._score
-        else:
-            # Board didn't change, but check if game is over anyway
-            if not self._check_if_any_moves_possible():
-                self._game_over = True
-            return np.int64(0), self._score
-
-    def simulate_move(self, direction: int) -> Tuple[bool, np.int64, np.int64, BoardType]:
-        """
-        Simulates a move in the given direction without altering the game state.
-        Returns the results of the move without committing changes.
-
-        Args:
-            direction (int): 0: Up, 1: Right, 2: Down, 3: Left.
-
-        Returns:
-            tuple: (board_changed, score_gain, total_score_after, new_board)
-                - board_changed (bool): Whether the move would change the board
-                - score_gain (np.int64): Score that would be added by this move
-                - total_score_after (np.int64): What the total score would be after the move
-                - new_board (BoardType): The resulting board state after the move
-
-        Note:
-            This does NOT generate new tiles or update game state.
-            Useful for AI planning and simulations.
-        """
-        if self._game_over:
-            return False, np.int64(0), self._score, self._board.copy()
-
-        assert 0 <= direction <= 3, "Invalid direction. Use 0 (Up), 1 (Right), 2 (Down), or 3 (Left)."
-
-        original_board: BoardType = self._board.copy()
-        new_board: BoardType = self._board.copy()  # Start with current state
-        total_score_gain: np.int64 = np.int64(0)
-
-        # --- Execute Move Logic (No Rotation) ---
-        reverse: bool
-        processed_line: np.ndarray[Any, np.dtype[np.int64]]
-        gain: np.int64
-        if direction == self.LEFT or direction == self.RIGHT:
-            reverse = (direction == self.RIGHT)
-            for r in range(self.height):
-                processed_line, gain = self._process_line(new_board[r, :], reverse)
-                new_board[r, :] = processed_line
-                total_score_gain += gain
-        elif direction == self.UP or direction == self.DOWN:
-            reverse = (direction == self.DOWN)
-            for c in range(self.width):
-                processed_line, gain = self._process_line(new_board[:, c], reverse)
-                new_board[:, c] = processed_line
-                total_score_gain += gain
-        # --- End Move Logic ---
-
-        board_changed: bool = not np.array_equal(original_board, new_board)
-        new_total_score = self._score + total_score_gain if board_changed else self._score
-
-        return board_changed, total_score_gain, new_total_score, new_board
-
-    def generate_tiles(self) -> bool:
-        """
-        Generates a new tile on the board based on spawn rates.
-        Returns True if successful, False if no empty cells are available.
-        """
+        new_board = board.copy()
+        added_count = 0
+        actions = []
         for _ in range(self.num_spawn_tiles_per_move):
-            if not self._add_random_tile():
-                return False
-        return True
+            spawn_result = _add_random_tile_numba(new_board, self._spawn_values_np, self._spawn_weights_np)
+            if spawn_result:
+                r, c, val = spawn_result
+                new_board[r, c] = val # Modify the copy
+                added_count += 1
+                if return_action:
+                    actions.append((r, c, val))
+            else:
+                break # No empty space left
+        if return_action:
+            return new_board, actions
+        else:
+            return new_board
 
-    def clone(self) -> 'Simplified2048':
-        """
-        Creates an efficient copy of the game state.
-        """
-        new_game = Simplified2048.__new__(Simplified2048) # Create instance without calling __init__
-        new_game.height = self.height
-        new_game.width = self.width
-        # Copy spawn config
-        new_game._spawn_rates = self._spawn_rates.copy()
-        new_game._spawn_values = self._spawn_values[:]
-        new_game._spawn_weights = self._spawn_weights[:]
-        new_game.num_spawn_tiles_per_move = self.num_spawn_tiles_per_move
-        new_game.num_initial_tiles = self.num_initial_tiles
-        # Copy game state
-        new_game._board = self._board.copy()
-        new_game._score = self._score
-        new_game._game_over = self._game_over
-        return new_game
+    def get_max_tile(self, board: BoardType) -> np.int64:
+         if board.size == 0:
+             return np.int64(0)
+         return np.max(board)
 
-    def render_ascii(self, cell_width: int = 6) -> str:
-        """Returns an ASCII string representation of the board."""
+    def render_ascii(self, board: BoardType, cell_width: int = 6) -> str:
         separator: str = "+" + ("-" * cell_width + "+") * self.width
         output: List[str] = [separator]
         for r in range(self.height):
             row_str: List[str] = ["|"]
             for c in range(self.width):
-                val: np.int64 = self._board[r, c]
+                val: np.int64 = board[r, c]
                 cell_str: str = str(val) if val != 0 else "."
                 row_str.append(cell_str.center(cell_width))
                 row_str.append("|")
@@ -211,205 +248,248 @@ class Simplified2048:
             output.append(separator)
         return "\n".join(output)
 
-    # --- Additional Helper Methods ---
+
+class GameRunner:
+    rules: GameRules
+    current_board: BoardType
+    current_score: np.int64
+    game_over: bool
+
+    def __init__(self, rules: GameRules):
+        self.rules = rules
+        initial_state = self.rules.get_initial_state()
+        self.current_board = initial_state.board
+        self.current_score = initial_state.score
+        self.game_over = self.rules.is_terminal(self.current_board)
+
+    def get_board(self) -> BoardType:
+        return self.current_board.copy()
+
+    def get_score(self) -> np.int64:
+        return self.current_score
+
+    def is_game_over(self) -> bool:
+        if self.game_over:
+            return True
+        # Re-check in case tiles were generated into a terminal state
+        self.game_over = self.rules.is_terminal(self.current_board)
+        return self.game_over
+
+    def move(self, direction: int) -> Tuple[np.int64, np.int64]:
+        if self.is_game_over():
+            return np.int64(0), self.current_score
+        assert 0 <= direction <= 3
+
+        board_changed, score_gain, new_board = self.rules.simulate_move(
+            self.current_board, direction
+        )
+
+        if board_changed:
+            self.current_board = new_board
+            self.current_score += score_gain
+            # Don't check game over here, check after potential tile generation
+            return score_gain, self.current_score
+        else:
+            return np.int64(0), self.current_score
+
+    def generate_tiles(self) -> bool:
+        if self.is_game_over():
+             return False # Cannot generate if already over
+
+        initial_empty = np.count_nonzero(self.current_board == 0)
+        if initial_empty == 0:
+            self.game_over = self.rules.is_terminal(self.current_board)
+            return False # Board is full
+
+        self.current_board = self.rules.add_random_tiles(self.current_board)
+
+        final_empty = np.count_nonzero(self.current_board == 0)
+        tiles_generated = initial_empty - final_empty
+
+        # Check game over *after* adding tiles
+        self.game_over = self.rules.is_terminal(self.current_board)
+
+        return tiles_generated >= min(initial_empty, self.rules.num_spawn_tiles_per_move)
+
+
+    def clone(self) -> 'GameRunner':
+        new_runner = GameRunner.__new__(GameRunner)
+        new_runner.rules = self.rules # Share the rules object
+        new_runner.current_board = self.current_board.copy()
+        new_runner.current_score = self.current_score
+        new_runner.game_over = self.game_over
+        return new_runner
+
+    def render_ascii(self, cell_width: int = 6) -> str:
+        return self.rules.render_ascii(self.current_board, cell_width)
 
     def get_valid_moves(self) -> List[int]:
-        """
-        Returns a list of directions (int) that would result in a board change.
-        """
-        valid: List[int] = []
-        original_board: BoardType = self._board.copy() # Keep original safe
-
-        for direction in self.DIRECTIONS:
-            temp_board: BoardType = original_board.copy() # Work on a copy for checking
-            self._execute_move_on_board(direction, temp_board) # Simulate move on copy
-            if not np.array_equal(original_board, temp_board):
-                valid.append(direction)
-        return valid
+        if self.is_game_over():
+            return []
+        return self.rules.get_valid_moves(self.current_board)
 
     def get_max_tile(self) -> np.int64:
-        """Returns the value of the highest tile on the board."""
-        return np.max(self._board) if self._board.size > 0 else np.int64(0)
+        return self.rules.get_max_tile(self.current_board)
 
-    # --- Internal Logic ---
 
-    def _add_random_tile(self) -> bool:
-        """Adds a random tile based on spawn_rates to an empty cell. Returns True if successful."""
-        empty_cells: np.ndarray = np.argwhere(self._board == 0)
-        if len(empty_cells) == 0:
-            return False # No space left
-
-        idx: int = np.random.randint(len(empty_cells))
-        r: int
-        c: int
-        r, c = empty_cells[idx]
-        # Use pre-calculated lists for efficiency
-        val: int = random.choices(self._spawn_values, weights=self._spawn_weights, k=1)[0]
-        self._board[r, c] = val
-        return True
-
-    def _execute_move_on_board(self, direction: int, board: BoardType) -> None:
-        """
-        Helper for get_valid_moves. Performs move logic on a given board *without*
-        updating score or internal state. Modifies the passed board directly.
-        """
-        reverse: bool
-        processed_line: np.ndarray[Any, np.dtype[np.int64]]
-        if direction == self.LEFT or direction == self.RIGHT:
-            reverse = (direction == self.RIGHT)
-            for r in range(self.height):
-                processed_line, _ = self._process_line(board[r, :], reverse)
-                board[r, :] = processed_line
-        elif direction == self.UP or direction == self.DOWN:
-            reverse = (direction == self.DOWN)
-            for c in range(self.width):
-                processed_line, _ = self._process_line(board[:, c], reverse)
-                board[:, c] = processed_line
-
-    def _process_line(self, line: np.ndarray[Any, np.dtype[np.int64]], reverse: bool) -> Tuple[np.ndarray[Any, np.dtype[np.int64]], np.int64]:
-        """
-        Processes a single line (row/column) for sliding and merging.
-
-        Args:
-            line (1D NumPy array): The line to process.
-            reverse (bool): If True, process movement towards the end of the line.
-
-        Returns:
-            tuple: (new_line, merge_score)
-        """
-        line_len: int = len(line)
-        temp_line: np.ndarray[Any, np.dtype[np.int64]] = line.copy()
-
-        if reverse:
-            temp_line = temp_line[::-1] # Reverse for processing
-
-        # 1. Compress: Move non-zero elements to the left (index 0)
-        compressed: np.ndarray[Any, np.dtype[np.int64]] = temp_line[temp_line != 0]
-        processed_line: np.ndarray[Any, np.dtype[np.int64]] = np.zeros_like(temp_line)
-        merge_score: np.int64 = np.int64(0)
-        write_idx: int = 0
-
-        # 2. Merge
-        i: int = 0
-        while i < len(compressed):
-            current_val: np.int64 = compressed[i]
-
-            if i + 1 < len(compressed) and current_val == compressed[i+1]:
-                merged_val: np.int64 = current_val * 2
-                processed_line[write_idx] = merged_val
-                merge_score += merged_val
-                write_idx += 1
-                i += 2 # Skip both merged tiles
-            else:
-                processed_line[write_idx] = current_val
-                write_idx += 1
-                i += 1 # Move to next tile
-
-        if reverse:
-            processed_line = processed_line[::-1] # Reverse back
-
-        return processed_line, merge_score
-
-    def _check_if_any_moves_possible(self) -> bool:
-        """Checks if any move would change the board state OR if empty cells exist."""
-        # 1. Check for empty cells first (fastest check)
-        if np.any(self._board == 0):
-            return True
-
-        # 2. Check for adjacent identical cells (possible merges)
-        # Horizontal checks
-        for r in range(self.height):
-            for c in range(self.width - 1):
-                if self._board[r, c] == self._board[r, c + 1]:
-                    return True
-        # Vertical checks
-        for c in range(self.width):
-            for r in range(self.height - 1):
-                if self._board[r, c] == self._board[r + 1, c]:
-                    return True
-
-        # No empty cells and no possible merges
-        return False
-
-# --- Example Usage ---
 if __name__ == "__main__":
 
-    # set seeds
-    # random.seed(42)
-    # np.random.seed(42)
-
-    # Example 1: Standard 4x4 (default: 1 tile per move)
-    print("--- Standard 4x4 Game (1 tile/move) ---")
-    game: Simplified2048 = Simplified2048(height=4, width=4)
+    print("--- Standard 4x4 Game (1 tile/move, New Arch) ---")
+    rules_4x4_1tile = GameRules(height=4, width=4, num_spawn_tiles_per_move=1)
+    game = GameRunner(rules_4x4_1tile)
     print("Initial State:")
     print(game.render_ascii())
     print(f"Score: {game.get_score()}")
-    game.move(game.DOWN)
-    print("\nAfter DOWN move:")
-    print(game.render_ascii())
-    print(f"Score: {game.get_score()}")
+    print(f"Game Over: {game.is_game_over()}")
+    print(f"Valid Moves: {game.get_valid_moves()}")
+
+    valid_moves_initial = game.get_valid_moves()
+    chosen_move = GameRules.DOWN if GameRules.DOWN in valid_moves_initial else (valid_moves_initial[0] if valid_moves_initial else -1)
+
+    if chosen_move != -1:
+        print(f"\nAttempting move: {chosen_move}")
+        score_gain, total_score = game.move(chosen_move)
+        print(f"Score Gain: {score_gain}, New Total Score: {total_score}")
+        if score_gain > 0 or np.count_nonzero(game.current_board == 0) > 0:
+           tiles_generated = game.generate_tiles()
+           print(f"Tiles Generated: {tiles_generated}")
+        else:
+            print("Skipping tile generation as move had no effect or board full")
+
+
+        print("\nAfter move + tile generation:")
+        print(game.render_ascii())
+        print(f"Score: {game.get_score()}")
+        print(f"Game Over: {game.is_game_over()}")
+        print(f"Valid Moves: {game.get_valid_moves()}")
+    else:
+        print("\nNo valid moves initially.")
     print("-" * 40)
 
-    # Example 2: 4x4 with 2 tiles per move
-    print("--- Standard 4x4 Game (2 tiles/move) ---")
-    game_2_tiles: Simplified2048 = Simplified2048(height=4, width=4, num_spawn_tiles_per_move=2)
+
+    print("--- Standard 4x4 Game (2 tiles/move, New Arch) ---")
+    rules_4x4_2tile = GameRules(height=4, width=4, num_spawn_tiles_per_move=2)
+    game_2_tiles = GameRunner(rules_4x4_2tile)
     print("Initial State:")
     print(game_2_tiles.render_ascii())
     print(f"Score: {game_2_tiles.get_score()}")
-    game_2_tiles.move(game_2_tiles.RIGHT)
-    print("\nAfter RIGHT move:")
-    print(game_2_tiles.render_ascii()) # Should have 2 new tiles if space allows
-    print(f"Score: {game_2_tiles.get_score()}")
-    game_2_tiles.move(game_2_tiles.UP)
-    print("\nAfter UP move:")
-    print(game_2_tiles.render_ascii()) # Should have 2 more new tiles
-    print(f"Score: {game_2_tiles.get_score()}")
+
+    if GameRules.RIGHT in game_2_tiles.get_valid_moves():
+        game_2_tiles.move(GameRules.RIGHT)
+        game_2_tiles.generate_tiles()
+        print("\nAfter RIGHT move + tile generation:")
+        print(game_2_tiles.render_ascii())
+        print(f"Score: {game_2_tiles.get_score()}")
+    else:
+       print("\nRIGHT move not valid.")
+
+
+    if GameRules.UP in game_2_tiles.get_valid_moves():
+        game_2_tiles.move(GameRules.UP)
+        game_2_tiles.generate_tiles()
+        print("\nAfter UP move + tile generation:")
+        print(game_2_tiles.render_ascii())
+        print(f"Score: {game_2_tiles.get_score()}")
+    else:
+       print("\nUP move not valid.")
     print("-" * 40)
 
 
-    # Example 3: Custom Size and Spawn Rates (More 4s)
-    print("--- Custom 3x5 Game (More 4s, 1 tile/move) ---")
+    print("--- Custom 3x5 Game (More 4s, 1 tile/move, New Arch) ---")
     custom_rates: Dict[int, float] = {2: 0.5, 4: 0.5}
-    game_custom: Simplified2048 = Simplified2048(height=3, width=5, spawn_rates=custom_rates)
+    rules_custom = GameRules(height=3, width=5, spawn_rates=custom_rates, num_spawn_tiles_per_move=1)
+    game_custom = GameRunner(rules_custom)
     print("Initial State:")
     print(game_custom.render_ascii(cell_width=5))
     print(f"Score: {game_custom.get_score()}")
 
     move_names: Dict[int, str] = {0: "Up", 1: "Right", 2: "Down", 3: "Left"}
     turn: int = 0
-    gain: np.int64
-    total_score: np.int64
     while not game_custom.is_game_over():
         turn += 1
         valid_moves: List[int] = game_custom.get_valid_moves()
-        if not valid_moves: break
-        chosen_move: int = random.choice(valid_moves)
-        print(f"\nTurn {turn}: Action: {move_names[chosen_move]}")
-        gain, total_score = game_custom.move(chosen_move)
-        game_custom.generate_tiles()
-        print(game_custom.render_ascii(cell_width=5))
-        print(f"Score Gain: {gain}, Total Score: {total_score}")
+        if not valid_moves:
+             print(f"\nTurn {turn}: No valid moves detected! Game over.")
+             break
 
-    print("\n--- CUSTOM GAME OVER ---")
+        chosen_move: int = random.choice(valid_moves)
+        print(f"\nTurn {turn}: Action: {move_names[chosen_move]} (Valid: {valid_moves})")
+
+        board_before = game_custom.get_board()
+        gain, _ = game_custom.move(chosen_move)
+        board_after_move = game_custom.get_board()
+
+        tiles_generated = False
+        # Only generate tiles if the move changed the board
+        if np.any(board_before != board_after_move):
+            tiles_generated = game_custom.generate_tiles()
+
+        print(game_custom.render_ascii(cell_width=5))
+        print(f"Score Gain: {gain}, Total Score: {game_custom.get_score()}")
+        if not tiles_generated and np.count_nonzero(game_custom.current_board) == game_custom.rules.height * game_custom.rules.width:
+             print("Tile generation failed or skipped - board is full.")
+
+
+    print(f"\n--- CUSTOM GAME FINISHED (Turn {turn}) ---")
     print("Final Board:")
     print(game_custom.render_ascii(cell_width=5))
     print(f"Final Score: {game_custom.get_score()}")
     print(f"Max Tile: {game_custom.get_max_tile()}")
+    print(f"Is Game Over: {game_custom.is_game_over()}")
 
-    # Example 4: Cloning with new config
-    print("\n--- Cloning Demo (2 tiles/move config) ---")
-    game_to_clone: Simplified2048 = Simplified2048(4, 4, num_spawn_tiles_per_move=2)
+
+    print("\n--- Cloning Demo (2 tiles/move config, New Arch) ---")
+    rules_clone_test = GameRules(4, 4, num_spawn_tiles_per_move=2)
+    game_to_clone = GameRunner(rules_clone_test)
     print("Original Game (Turn 0):")
     print(game_to_clone.render_ascii())
-    clone: Simplified2048 = game_to_clone.clone()
-    print(f"Clone num_spawn_tiles_per_move: {clone.num_spawn_tiles_per_move}")
-    # Move original
-    game_to_clone.move(game_to_clone.RIGHT)
-    print("\nOriginal Game After RIGHT:")
-    print(game_to_clone.render_ascii())
-    print("Clone State (Should be unchanged):")
+
+    clone = game_to_clone.clone()
+    print(f"Clone num_spawn_tiles_per_move: {clone.rules.num_spawn_tiles_per_move}")
+
+    if GameRules.RIGHT in game_to_clone.get_valid_moves():
+        game_to_clone.move(GameRules.RIGHT)
+        game_to_clone.generate_tiles()
+        print("\nOriginal Game After RIGHT + Generation:")
+        print(game_to_clone.render_ascii())
+    else:
+        print("\nOriginal Game: RIGHT move not valid.")
+
+
+    print("Clone State (Should be unchanged from Original Turn 0):")
     print(clone.render_ascii())
-    # Move clone
-    clone.move(clone.UP)
-    print("\nClone State After UP:")
-    print(clone.render_ascii()) # Should have 2 new tiles
+
+    if GameRules.UP in clone.get_valid_moves():
+        clone.move(GameRules.UP)
+        clone.generate_tiles()
+        print("\nClone State After UP + Generation:")
+        print(clone.render_ascii())
+        print(f"Clone Score: {clone.get_score()}")
+    else:
+         print("\nClone Game: UP move not valid.")
+
+    # Verify MCTS usage pattern: using rules directly
+    print("\n--- MCTS Simulation Example ---")
+    rules = GameRules(4, 4)
+    start_state = rules.get_initial_state()
+    print("MCTS Start State:")
+    print(rules.render_ascii(start_state.board))
+    print(f"Score: {start_state.score}")
+
+    valid_moves = rules.get_valid_moves(start_state.board)
+    if valid_moves:
+        print(f"Valid moves from start state: {valid_moves}")
+        # Simulate taking the first valid move
+        chosen_move = valid_moves[0]
+        changed, gain, board_after_move = rules.simulate_move(start_state.board, chosen_move)
+        print(f"\nSimulating move {chosen_move}: Changed={changed}, Gain={gain}")
+        print("Board after move:")
+        print(rules.render_ascii(board_after_move))
+
+        # Simulate adding random tiles (stochastic step)
+        board_after_tiles = rules.add_random_tiles(board_after_move)
+        print("\nBoard after random tile generation:")
+        print(rules.render_ascii(board_after_tiles))
+        print(f"Terminal state after tiles: {rules.is_terminal(board_after_tiles)}")
+    else:
+        print("No valid moves from start state.")

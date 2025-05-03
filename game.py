@@ -1,308 +1,328 @@
 import numpy as np
 import random
-import math
-import time # Can use time for internal logic if needed, but not Pygame time
+from typing import Dict, List, Tuple, Optional, Any
+from game_alt import Simplified2048
 
-# --- Constants for Logic (can be overridden) ---
-DEFAULT_BOARD_SIZE = 4
-DEFAULT_SPAWN_RATES = {2: 0.9, 4: 0.1}
-WIN_TILE = 2048
 
-class Game2048Animation:
-    def __init__(self, size=DEFAULT_BOARD_SIZE, spawn_rates=DEFAULT_SPAWN_RATES, win_tile=WIN_TILE):
-        self.size = size
-        self.spawn_rates = spawn_rates
+class Simplified2048Adapter:
+    """
+    Adapter class to make Simplified2048 compatible with PygameInterface.
+    Translates between the Simplified2048 implementation and the interface
+    expected by PygameInterface.
+    """
+
+    # Direction mapping from string to int
+    DIRECTION_MAP = {
+        'up': 0,
+        'right': 1,
+        'down': 2,
+        'left': 3
+    }
+
+    # Default win tile
+    WIN_TILE = 2048
+
+    def __init__(self, height=4, width=4, spawn_rates={2: 0.9, 4: 0.1},
+                 num_spawn_tiles_per_move=1, num_initial_tiles=2, win_tile=WIN_TILE):
+        """Initialize with Simplified2048 parameters"""
+        self.game = Simplified2048(
+            height=height,
+            width=width,
+            spawn_rates=spawn_rates,
+            num_spawn_tiles_per_move=num_spawn_tiles_per_move,
+            num_initial_tiles=num_initial_tiles
+        )
+        self.listeners = []
+        self.size = height  # Assuming square board where width == height for interface compatibility
         self.win_tile = win_tile
-        self.listeners = [] # For callbacks
-
-        self.score = 0
-        self.board = np.zeros((self.size, self.size), dtype=int)
-        self.game_over = False
-        self.game_won = False # Track win state separately
-        self.highest_tile = 0
-        self._last_spawned_tile = None # Store (r, c, value) of the last spawned tile
-
-        self._initialize_board()
+        self.game_won = False
+        self.last_spawned_tile = None
+        self.last_board = self.game.get_board().copy()
 
     def add_listener(self, listener):
         if listener not in self.listeners:
             self.listeners.append(listener)
 
     def remove_listener(self, listener):
-        self.listeners.remove(listener)
+        if listener in self.listeners:
+            self.listeners.remove(listener)
 
     def _notify(self, event_name, *args, **kwargs):
         for listener in self.listeners:
             if hasattr(listener, event_name):
                 getattr(listener, event_name)(*args, **kwargs)
 
-    def _initialize_board(self):
-        self.score = 0
-        self.board = np.zeros((self.size, self.size), dtype=int)
-        self.game_over = False
-        self.game_won = False
-        self.highest_tile = 0
-        self._last_spawned_tile = None
-        self._add_random_tile()
-        self._add_random_tile()
-        self._notify('on_reset', self.board.copy(), self.score) # Notify listeners of initial state
-
-    def reset(self):
-        self._initialize_board()
-
     def get_board(self):
-        return self.board.copy() # Return a copy to prevent external modification
+        return self.game.get_board().astype(int)  # Convert from np.int64 to int
 
     def get_score(self):
-        return self.score
+        return int(self.game.get_score())  # Convert from np.int64 to int
 
     def is_game_over(self):
-        return self.game_over
+        return self.game.is_game_over()
 
     def has_won(self):
-        return self.game_won
+        # Check win state based on max tile
+        if self.game_won:
+            return True
 
-    def get_highest_tile(self):
-        return self.highest_tile
+        if int(self.game.get_max_tile()) >= self.win_tile:
+            self.game_won = True
+            self._notify('on_win')
+            return True
+        return False
 
-    def get_last_spawned_tile(self):
-        return self._last_spawned_tile
+    def reset(self):
+        # Create a new game with same parameters
+        height = self.game.height
+        width = self.game.width
+        spawn_rates = self.game._spawn_rates
+        tiles_per_move = self.game.num_spawn_tiles_per_move
+        init_tiles = self.game.num_initial_tiles
 
-    def _add_random_tile(self):
-        empty_cells = [(r, c) for r in range(self.size) for c in range(self.size) if self.board[r, c] == 0]
-        if not empty_cells:
-            return False
+        # Create new game instance
+        self.game = Simplified2048(
+            height=height,
+            width=width,
+            spawn_rates=spawn_rates,
+            num_spawn_tiles_per_move=tiles_per_move,
+            num_initial_tiles=init_tiles
+        )
 
-        r, c = random.choice(empty_cells)
-        new_value = random.choices(list(self.spawn_rates.keys()), weights=list(self.spawn_rates.values()), k=1)[0]
-        self.board[r, c] = new_value
-        self.highest_tile = max(self.highest_tile, new_value)
-        self._last_spawned_tile = (r, c, new_value)
+        self.game_won = False
+        self.last_board = self.game.get_board().copy()
+        self.last_spawned_tile = None
 
-        self._notify('on_tile_spawned', r, c, new_value)
-        return True
-
-    def _compress(self, line):
-        new_line = []
-        original_indices = []
-        for i, x in enumerate(line):
-            if x != 0:
-                new_line.append(x)
-                original_indices.append(i)
-        return new_line, original_indices
-
-    def _merge(self, line_values, original_indices):
-        score_gain = 0
-        merged_values = []
-        merged_indices = [] # Tracks the original index that *results* in the merged value
-        merge_animations_info = [] # List of ((start1_idx, start2_idx), end_idx, value) within the line axis
-
-        i = 0
-        while i < len(line_values):
-            if i + 1 < len(line_values) and line_values[i] == line_values[i+1]:
-                merged_value = line_values[i] * 2
-                score_gain += merged_value
-                self.highest_tile = max(self.highest_tile, merged_value)
-                merged_values.append(merged_value)
-                # Resulting tile ends up at the position corresponding to the second original tile
-                merged_indices.append(original_indices[i+1])
-                merge_animations_info.append(((original_indices[i], original_indices[i+1]), original_indices[i+1], merged_value))
-                i += 2
-            else:
-                merged_values.append(line_values[i])
-                merged_indices.append(original_indices[i])
-                i += 1
-
-        return merged_values, merged_indices, score_gain, merge_animations_info
+        # Notify listeners
+        self._notify('on_reset', self.get_board(), self.get_score())
 
     def move(self, direction):
         """
-        Attempts to move tiles in the given direction ('up', 'down', 'left', 'right').
+        Process move and generate animation info
+
+        Args:
+            direction (str): 'up', 'right', 'down', 'left'
 
         Returns:
             tuple: (moved, score_gain, animation_steps)
-            - moved (bool): True if the board state changed, False otherwise.
-            - score_gain (int): Score increase from this move.
-            - animation_steps (list or None): A list describing tile movements and merges
-              for visualization, or None if no move occurred. Each step is a dict:
-              {'value': v, 'start': (r,c), 'end': (r,c), 'type': 'move'/'merge_source'/'merge_result'}
         """
-        if self.game_over:
+        if self.is_game_over():
             return False, 0, None
 
-        original_board = self.board.copy()
-        temp_board = self.board.copy()
-        current_score_gain = 0
-        animation_steps = []
-
-        if direction in ['left', 'right']:
-            for r in range(self.size):
-                line = temp_board[r, :].copy()
-                is_reversed = (direction == 'right')
-                if is_reversed:
-                    line = line[::-1]
-
-                compressed_values, compressed_orig_indices = self._compress(line.tolist())
-                merged_values, merged_orig_indices, line_score_gain, merges_info = self._merge(compressed_values, compressed_orig_indices)
-                final_line_list = merged_values + [0] * (self.size - len(merged_values))
-
-                final_line = np.array(final_line_list, dtype=int)
-                if is_reversed:
-                    final_line = final_line[::-1]
-
-                temp_board[r, :] = final_line
-                current_score_gain += line_score_gain
-
-                # Convert line-based merge info to board coordinates and add to animation steps
-                for (start1_idx, start2_idx), end_idx, value in merges_info:
-                    s1_c = start1_idx if not is_reversed else self.size - 1 - start1_idx
-                    s2_c = start2_idx if not is_reversed else self.size - 1 - start2_idx
-                    e_c = end_idx if not is_reversed else self.size - 1 - end_idx
-                    animation_steps.append({'value': value // 2, 'start': (r, s1_c), 'end': (r, e_c), 'type': 'merge_source'})
-                    animation_steps.append({'value': value // 2, 'start': (r, s2_c), 'end': (r, e_c), 'type': 'merge_source'})
-                    animation_steps.append({'value': value, 'end': (r, e_c), 'type': 'merge_result'})
-
-        elif direction in ['up', 'down']:
-            for c in range(self.size):
-                line = temp_board[:, c].copy()
-                is_reversed = (direction == 'down')
-                if is_reversed:
-                    line = line[::-1]
-
-                compressed_values, compressed_orig_indices = self._compress(line.tolist())
-                merged_values, merged_orig_indices, line_score_gain, merges_info = self._merge(compressed_values, compressed_orig_indices)
-                final_line_list = merged_values + [0] * (self.size - len(merged_values))
-
-                final_line = np.array(final_line_list, dtype=int)
-                if is_reversed:
-                    final_line = final_line[::-1]
-
-                temp_board[:, c] = final_line
-                current_score_gain += line_score_gain
-
-                # Convert line-based merge info to board coordinates
-                for (start1_idx, start2_idx), end_idx, value in merges_info:
-                    s1_r = start1_idx if not is_reversed else self.size - 1 - start1_idx
-                    s2_r = start2_idx if not is_reversed else self.size - 1 - start2_idx
-                    e_r = end_idx if not is_reversed else self.size - 1 - end_idx
-                    animation_steps.append({'value': value // 2, 'start': (s1_r, c), 'end': (e_r, c), 'type': 'merge_source'})
-                    animation_steps.append({'value': value // 2, 'start': (s2_r, c), 'end': (e_r, c), 'type': 'merge_source'})
-                    animation_steps.append({'value': value, 'end': (e_r, c), 'type': 'merge_result'})
-
-        moved = not np.array_equal(original_board, temp_board)
-
-        if moved:
-            self.board = temp_board
-            self.score += current_score_gain
-
-            # Clear existing animation steps and rebuild with direction-aware logic
-            animation_steps = []
-
-            # First, add all merge animations (these are correct from existing code)
-            merge_source_starts = set()
-            merge_result_ends = {}
-
-            for step in animation_steps:
-                if step['type'] == 'merge_source':
-                    merge_source_starts.add(step['start'])
-
-                if step['type'] == 'merge_result':
-                    merge_result_ends[step['end']] = step['value']
-
-            # Direction-aware movement determination
-            # For each non-zero tile in the final board that isn't a merge result
-            direction_offsets = {
-                'left': (0, -1),
-                'right': (0, 1),
-                'up': (-1, 0),
-                'down': (1, 0)
-            }
-            dr, dc = direction_offsets[direction]
-
-            # Track processed original positions to avoid duplication
-            processed_origins = set(merge_source_starts)
-
-            # For each cell in the final state
-            for r_final in range(self.size):
-                for c_final in range(self.size):
-                    value = self.board[r_final, c_final]
-                    if value == 0: continue
-
-                    final_pos = (r_final, c_final)
-                    if final_pos in merge_result_ends: continue
-
-                    # Look backward along the direction vector for the source
-                    found = False
-                    r_check, c_check = r_final, c_final
-
-                    # Search backward in direction of movement
-                    while 0 <= r_check < self.size and 0 <= c_check < self.size:
-                        r_check -= dr
-                        c_check -= dc
-
-                        # If we go out of bounds, break
-                        if not (0 <= r_check < self.size and 0 <= c_check < self.size):
-                            break
-
-                        check_pos = (r_check, c_check)
-
-                        # If we find a matching value in original board and it's not already processed
-                        if original_board[check_pos] == value and check_pos not in processed_origins:
-                            # We found our source
-                            if check_pos != final_pos:  # Only add if actually moved
-                                animation_steps.append({
-                                    'value': value,
-                                    'start': check_pos,
-                                    'end': final_pos,
-                                    'type': 'move'
-                                })
-                            processed_origins.add(check_pos)
-                            found = True
-                            break
-
-                    # If no source found backward, use the same position if it had the value
-                    if not found and original_board[final_pos] == value and final_pos not in processed_origins:
-                        # Tile didn't move, but should be included in processed list
-                        processed_origins.add(final_pos)
-
-            # Now fix the new tile spawning timing in interface.py
-            self._notify('on_move_complete', animation_steps)
-
-            # IMPORTANT CHANGE: Move new tile generation to after animation completes
-            # This gets handled through the animation callbacks now
-            # The PygameInterface will call the appropriate method when animations finish
-
-            # Check game state after adding tile
-            if not self._any_moves_possible():
-                self.game_over = True
-                self._notify('on_game_over')
-
-            if not self.game_won and self.highest_tile >= self.win_tile:
-                self.game_won = True
-                self._notify('on_win')
-
-            return True, current_score_gain, animation_steps
-        else:
-            # Check for game over if no move was possible
-            if not self._any_moves_possible():
-                self.game_over = True
-                self._notify('on_game_over')
+        # Convert string direction to integer
+        dir_int = self.DIRECTION_MAP.get(direction)
+        if dir_int is None:
             return False, 0, None
 
-    def _any_moves_possible(self):
-        # Check for empty cells
-        if np.any(self.board == 0):
+        # Save board state before move for calculating animations
+        original_board = self.game.get_board().copy()
+
+        # Perform the move
+        score_gain, _ = self.game.move(dir_int)
+        board_changed = score_gain > 0 or np.any(original_board != self.game.get_board())
+
+        if not board_changed:
+            return False, 0, None
+
+        # Generate animation steps based on board comparison
+        animation_steps = self._generate_animation_steps(original_board, self.game.get_board(), direction)
+
+        # Notify listeners of move completion
+        self._notify('on_move_complete', animation_steps)
+
+        # Check win condition
+        if not self.game_won and int(self.game.get_max_tile()) >= self.win_tile:
+            self.game_won = True
+            self._notify('on_win')
+
+        return True, int(score_gain), animation_steps
+
+    def _add_random_tile(self):
+        """Add a random tile and notify listeners"""
+        current_board = self.game.get_board()
+        empty_cells_before = set(zip(*np.where(current_board == 0)))
+
+        if self.game.generate_tiles():
+            new_board = self.game.get_board()
+
+            # Find the new tile(s)
+            for r in range(self.game.height):
+                for c in range(self.game.width):
+                    if new_board[r, c] > 0 and current_board[r, c] == 0:
+                        # Found a new tile
+                        tile_value = int(new_board[r, c])
+                        self.last_spawned_tile = (r, c, tile_value)
+                        self._notify('on_tile_spawned', r, c, tile_value)
+
+            self.last_board = new_board.copy()
+
+            # Check if game is over after generating tiles
+            if self.game.is_game_over():
+                self._notify('on_game_over')
+
             return True
-        # Check for possible merges horizontally
-        for r in range(self.size):
-            for c in range(self.size - 1):
-                if self.board[r, c] == self.board[r, c+1]:
-                    return True
-        # Check for possible merges vertically
-        for c in range(self.size):
-            for r in range(self.size - 1):
-                if self.board[r, c] == self.board[r+1, c]:
-                    return True
         return False
 
-# --- End of Game Logic ---
+    def get_highest_tile(self):
+        return int(self.game.get_max_tile())
+
+    def get_last_spawned_tile(self):
+        return self.last_spawned_tile
+
+    def _generate_animation_steps(self, old_board, new_board, direction):
+        """
+        Generate animation steps for tile movements and merges
+
+        Args:
+            old_board: Board state before move
+            new_board: Board state after move
+            direction: String direction of the move
+
+        Returns:
+            List of animation step dictionaries
+        """
+        animation_steps = []
+
+        # Track processed tiles
+        processed_old_positions = set()
+        processed_new_positions = set()
+
+        # Direction vector for movement tracing
+        dir_vector = {
+            'up': (-1, 0),
+            'right': (0, 1),
+            'down': (1, 0),
+            'left': (0, -1)
+        }[direction]
+
+        # First pass: Find merges - look for positions where value in new board is double some value in old board
+        for r in range(self.game.height):
+            for c in range(self.game.width):
+                new_val = new_board[r, c]
+                if new_val == 0:
+                    continue
+
+                # If this is a power of 2 greater than 2
+                if new_val > 2 and (new_val & (new_val - 1)) == 0:
+                    half_val = new_val // 2
+
+                    # Count half_vals in old board
+                    half_val_count = np.sum(old_board == half_val)
+
+                    # If there are at least 2 half_vals in old board, this is likely a merge
+                    if half_val_count >= 2:
+                        # Find the half_val tiles in old board
+                        half_val_positions = []
+                        for old_r in range(self.game.height):
+                            for old_c in range(self.game.width):
+                                if old_board[old_r, old_c] == half_val:
+                                    half_val_positions.append((old_r, old_c))
+
+                        # Only use the first two sources we find
+                        if len(half_val_positions) >= 2:
+                            # Sort by closest to destination for more natural animation
+                            half_val_positions.sort(key=lambda pos: abs(pos[0] - r) + abs(pos[1] - c))
+                            source1, source2 = half_val_positions[:2]
+
+                            # Add move animations for the merging tiles
+                            animation_steps.append({
+                                'value': half_val,
+                                'start': source1,
+                                'end': (r, c),
+                                'type': 'merge_source'
+                            })
+                            animation_steps.append({
+                                'value': half_val,
+                                'start': source2,
+                                'end': (r, c),
+                                'type': 'merge_source'
+                            })
+
+                            # Add the merge result animation
+                            animation_steps.append({
+                                'value': new_val,
+                                'end': (r, c),
+                                'type': 'merge_result'
+                            })
+
+                            # Mark these positions as processed
+                            processed_old_positions.add(source1)
+                            processed_old_positions.add(source2)
+                            processed_new_positions.add((r, c))
+
+        # Second pass: Process simple movements - tiles that moved but didn't merge
+        # Process tiles in the direction of movement to avoid ambiguity
+        rows = list(range(self.game.height))
+        cols = list(range(self.game.width))
+
+        # Adjust iteration order based on direction
+        if direction == 'down':
+            rows = rows[::-1]
+        elif direction == 'right':
+            cols = cols[::-1]
+
+        for r in rows:
+            for c in cols:
+                if new_board[r, c] > 0 and (r, c) not in processed_new_positions:
+                    new_val = new_board[r, c]
+
+                    # Look for source tiles in the direction opposite to movement
+                    found_source = False
+                    search_r, search_c = r, c
+                    dr, dc = -dir_vector[0], -dir_vector[1]
+
+                    # Try to find source along the direction of movement
+                    while True:
+                        search_r += dr
+                        search_c += dc
+
+                        if (search_r < 0 or search_r >= self.game.height or
+                                search_c < 0 or search_c >= self.game.width):
+                            break
+
+                        if (old_board[search_r, search_c] == new_val and
+                                (search_r, search_c) not in processed_old_positions):
+                            # Found a source, add move animation
+                            animation_steps.append({
+                                'value': new_val,
+                                'start': (search_r, search_c),
+                                'end': (r, c),
+                                'type': 'move'
+                            })
+
+                            processed_old_positions.add((search_r, search_c))
+                            processed_new_positions.add((r, c))
+                            found_source = True
+                            break
+
+                    # If not found in line, search the whole board
+                    if not found_source:
+                        for search_r in range(self.game.height):
+                            for search_c in range(self.game.width):
+                                if (old_board[search_r, search_c] == new_val and
+                                        (search_r, search_c) not in processed_old_positions):
+
+                                    # Skip if it's the same position (didn't move)
+                                    if (search_r, search_c) == (r, c):
+                                        processed_old_positions.add((search_r, search_c))
+                                        processed_new_positions.add((r, c))
+                                        found_source = True
+                                        break
+
+                                    # Add move animation
+                                    animation_steps.append({
+                                        'value': new_val,
+                                        'start': (search_r, search_c),
+                                        'end': (r, c),
+                                        'type': 'move'
+                                    })
+
+                                    processed_old_positions.add((search_r, search_c))
+                                    processed_new_positions.add((r, c))
+                                    found_source = True
+                                    break
+
+                            if found_source:
+                                break
+
+        return animation_steps

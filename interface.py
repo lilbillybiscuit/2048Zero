@@ -4,7 +4,6 @@ import math
 import time
 
 # --- Constants for Interface ---
-# (Copied from original Pygame code, ensure they match or are configurable)
 TILE_SIZE = 100
 MARGIN = 10
 SCORE_HEIGHT = 80
@@ -21,8 +20,8 @@ TILE_COLORS = {
     4096: (60, 58, 50), 8192: (60, 58, 50), 16384: (60, 58, 50),
     32768: (60, 58, 50), 65536: (60, 58, 50)
 }
-ANIMATION_DURATION_MS = 100 # Duration for move/merge animation
-NEW_TILE_ANIMATION_DURATION_MS = 150 # Duration for new tile appearance
+ANIMATION_DURATION_MS = 100  # Duration for move/merge animation
+NEW_TILE_ANIMATION_DURATION_MS = 150  # Duration for new tile appearance
 FPS = 60
 
 class PygameInterface:
@@ -38,24 +37,23 @@ class PygameInterface:
 
         pygame.init()
         self.screen = pygame.display.set_mode((self.window_width, self.window_height))
-        pygame.display.set_caption("2048")
+        pygame.display.set_caption("2048 Simplified")
         self.clock = pygame.time.Clock()
 
         self.font_score = pygame.font.SysFont("Arial", 40, bold=True)
         self.font_large = pygame.font.SysFont("Arial", 60, bold=True)
-        # Tile font created dynamically
 
-        self.game.add_listener(self) # Register for callbacks
+        self.game.add_listener(self)  # Register for callbacks
 
         self._animating_move = False
         self._animation_start_time = 0
         self._animation_steps = []
         self._animating_new_tile = False
-        self._new_tile_info = None # (r, c, value)
+        self._new_tile_info = None  # (r, c, value)
         self._new_tile_start_time = 0
 
         self._show_win_overlay = False
-        self._win_continue = False # Has the player chosen to continue after winning?
+        self._win_continue = False  # Has the player chosen to continue after winning?
 
     # --- Game Logic Listener Methods ---
     def on_reset(self, board, score):
@@ -77,7 +75,6 @@ class PygameInterface:
             # Ensure no lingering animation state if move was invalid but triggered checks
             self._animating_move = False
             self._animation_steps = []
-
 
     def on_tile_spawned(self, r, c, value):
         # Trigger new tile animation *after* move animation finishes
@@ -161,6 +158,7 @@ class PygameInterface:
                 self._animating_move = False
                 self._animation_steps = []
                 if not self.game.is_game_over():
+                    # Call the adapter's method to generate new tiles
                     self.game._add_random_tile()
 
                 # If a new tile was spawned, start its animation now
@@ -173,8 +171,7 @@ class PygameInterface:
              new_tile_anim_progress = min(1.0, elapsed / NEW_TILE_ANIMATION_DURATION_MS)
              if new_tile_anim_progress >= 1.0:
                   self._animating_new_tile = False
-                  self._new_tile_info = None # Clear after animation
-
+                  self._new_tile_info = None  # Clear after animation
 
         # --- Draw Tiles ---
         board_state = self.game.get_board()  # Get current state for drawing static tiles
@@ -290,12 +287,12 @@ class PygameInterface:
                             self.game.reset()
                     elif current_game_won and self._show_win_overlay:
                          if event.key == pygame.K_r:
-                              self.game.reset() # Reset will hide overlay via callback
+                              self.game.reset()  # Reset will hide overlay via callback
                          else:
                               # Continue playing
                               self._show_win_overlay = False
                               self._win_continue = True
-                    elif not self._animating_move and not self._animating_new_tile: # Only accept move input if not animating
+                    elif not self._animating_move and not self._animating_new_tile:  # Only accept move input if not animating
                         direction = None
                         if event.key == pygame.K_LEFT: direction = 'left'
                         elif event.key == pygame.K_RIGHT: direction = 'right'
@@ -303,7 +300,7 @@ class PygameInterface:
                         elif event.key == pygame.K_DOWN: direction = 'down'
 
                         if direction:
-                            self.game.move(direction) # Logic handles state update and notifies interface
+                            self.game.move(direction)  # Logic handles state update and notifies interface
 
             # Drawing
             self._draw_board()
