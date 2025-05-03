@@ -127,14 +127,7 @@ class Simplified2048:
             self._score += total_score_gain
 
             # Add the configured number of tiles
-            tiles_added_successfully: int = 0
-            added_tile: bool
-            for _ in range(self.num_spawn_tiles_per_move):
-                added_tile = self._add_random_tile()
-                if added_tile:
-                    tiles_added_successfully += 1
-                else:
-                    break # Stop adding if board is full
+            # self.generate_tiles()
 
             # Check for game over *after* attempting to add all tiles
             if not self._check_if_any_moves_possible():
@@ -144,8 +137,18 @@ class Simplified2048:
         else:
             # Board didn't change, but check if game is over anyway
             if not self._check_if_any_moves_possible():
-                 self._game_over = True
+                self._game_over = True
             return np.int64(0), self._score
+
+    def generate_tiles(self) -> bool:
+        """
+        Generates a new tile on the board based on spawn rates.
+        Returns True if successful, False if no empty cells are available.
+        """
+        for _ in range(self.num_spawn_tiles_per_move):
+            if not self._add_random_tile():
+                return False
+        return True
 
     def clone(self) -> 'Simplified2048':
         """
@@ -303,6 +306,11 @@ class Simplified2048:
 
 # --- Example Usage ---
 if __name__ == "__main__":
+
+    # set seeds
+    # random.seed(42)
+    # np.random.seed(42)
+
     # Example 1: Standard 4x4 (default: 1 tile per move)
     print("--- Standard 4x4 Game (1 tile/move) ---")
     game: Simplified2048 = Simplified2048(height=4, width=4)
@@ -344,13 +352,14 @@ if __name__ == "__main__":
     turn: int = 0
     gain: np.int64
     total_score: np.int64
-    while not game_custom.is_game_over() and turn < 15:
+    while not game_custom.is_game_over():
         turn += 1
         valid_moves: List[int] = game_custom.get_valid_moves()
         if not valid_moves: break
         chosen_move: int = random.choice(valid_moves)
         print(f"\nTurn {turn}: Action: {move_names[chosen_move]}")
         gain, total_score = game_custom.move(chosen_move)
+        game_custom.generate_tiles()
         print(game_custom.render_ascii(cell_width=5))
         print(f"Score Gain: {gain}, Total Score: {total_score}")
 
