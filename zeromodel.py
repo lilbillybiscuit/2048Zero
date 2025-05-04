@@ -1,6 +1,16 @@
 import torch
 import os
 from torch import nn
+from typing import List, Tuple, Any, Dict, Optional, Union
+import torch.nn.functional as F
+import numpy as np
+
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif torch.backends.mps.is_available():
+    device = 'mps'
+
 
 class ZeroResidualBlock(nn.Module):
     def __init__(self, filters):
@@ -36,8 +46,11 @@ class ZeroResidualBlock(nn.Module):
 
 
 class ZeroNetwork(nn.Module):
-    def __init__(self, n, m, k, filters=128, blocks=10):
+    def __init__(self, n: int, m: int, k: int, filters=128, blocks=10, infer_device='cpu'):
         super(ZeroNetwork, self).__init__()
+        self.n = n
+        self.m = m
+        self.k = k
         # input = k * n * m, where k is 2^k (max tile), n and m are dimensions
         self.conv1 = nn.Conv2d(in_channels=k, out_channels=filters, kernel_size=3, padding=1) # -> F x n x m
         self.conv2 = nn.Conv2d(in_channels=filters, out_channels=filters, kernel_size=3, padding=1)
@@ -50,14 +63,23 @@ class ZeroNetwork(nn.Module):
         self.flatten = nn.Flatten()
         self.policy_linear = nn.Linear(40*n*m, 4)
         self.softmax = nn.Softmax(dim=1)
+        self.infer_device = infer_device
 
         # value head
         self.value_conv1 = nn.Conv2d(in_channels=filters, out_channels=16, kernel_size=3, padding=1)
         self.value_conv2 = nn.Conv2d(in_channels=16, out_channels=8, kernel_size=3, padding=1)
         self.relu = nn.ReLU()
         self.value_linear1 = nn.Linear(8*n*m, 1)
+        self.infer_device = infer_device
+
+    def to(self, device: Union[str, torch.device]) -> 'ZeroNetwork':
+        """Move the model to the specified device."""
+        super().to(device)
+        self.infer_device = device
+        return self
 
     def forward(self, x):
+
         out = self.relu(self.conv1(x))
         out = self.conv2(out)
 
@@ -80,3 +102,15 @@ class ZeroNetwork(nn.Module):
 
         return policy_out, value_out
 
+    def _to_onehot(self, board: np.ndarray) -> torch.Tensor:
+        # board is batch x k x n x m
+        onehot = torch.tensor(board, dtype = torch.long, device = self.infer_device)
+        oh = F.one_hot(onehot, num_classes=self.k).permute(0,3,1,2).float()
+        return oh
+
+    def infer(self, board: np.ndarray) -> Tuple[List[float], float]:
+        batch_size = len(board)
+        p, v= self.forward(self._to_onehot(board))
+        p = p.detach().cpu().reshape(batch_size, 4).numpy()
+        v = v.detach().cpu().reshape(batch_size).numpy()
+        return p, v

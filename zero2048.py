@@ -11,12 +11,11 @@ import numba
 from tqdm import tqdm
 import os
 from game_alt import GameRules, GameState, BoardType
-from model import ZeroNetwork
+from zeromodel import ZeroNetwork
 import torch
 import multiprocessing
 
 __all__ = [
-    "ZeroModel",
     "ZeroMCTSNode",
     "ZeroPlayer",
 ]
@@ -29,96 +28,6 @@ elif torch.backends.cuda.is_available():
 ZeroProbs = Tuple[List[float], float]
 FILTERS, BLOCKS=8, 1
 
-# BoardType = np.ndarray[Any, np.dtype[np.int64]]
-
-class ZeroModel:
-    """Policy‑Value network interface.
-
-    `infer(board)` must return (priors, value):
-      • priors: length‑4 list of probabilities for U,R,D,L.
-      • value : scalar in [-1,1] estimating goodness for the *player*.
-    """
-    ACTIONS = 4  # up, right, down, left
-
-    def __init__(self, n=4, m=4, k=20, filters=FILTERS, blocks=BLOCKS, model = None):
-        if model is None:
-            self.model = ZeroNetwork(n, m, k, filters, blocks)
-
-    def infer(self, board: BoardType) -> ZeroProbs:
-        # *** Replace this with real NN inference ***
-        raise NotImplementedError
-        # priors = [1.0 / self.ACTIONS] * self.ACTIONS  # uniform policy
-        # # simple heuristic value: log2(max_tile)/11 ∈ [0,1]; scale to [-1,1]
-        # max_tile = board.max(initial=0)
-        # value = math.log2(max_tile + 1) / 11.0 * 2 - 1
-        # return priors, float(value)
-
-
-@numba.njit(cache=True)
-def to_one_hot_inplace(board: BoardType, result: np.ndarray, idx, n, m, k: int) -> None:
-    for i in range(n):
-        for j in range(m):
-            tile_value = board[i, j]
-            if tile_value > 0:
-                channel_idx = int(math.log2(tile_value) - 1 + 0.001)
-                if 1 <= channel_idx < k:
-                    result[channel_idx, i, j] = 1.0
-
-
-def to_one_hot(board: Union[BoardType, List[BoardType]], k: int) -> np.ndarray:
-    if not isinstance(board, list):
-        board = [board]
-
-    n, m = board[0].shape  # n = height (rows), m = width (cols)
-    # Standard shape: (batch, channels, height, width)
-    one_hot = np.zeros((len(board), k, n, m), dtype=np.float32)
-
-    for i, b in enumerate(board):
-        to_one_hot_inplace(b, one_hot[i], 0, n, m, k)
-
-    return one_hot
-
-class ZeroModelNN(ZeroModel):
-    """Policy‑Value network interface.
-
-    `infer(board)` must return (priors, value):
-      • priors: length‑4 list of probabilities for U,R,D,L.
-      • value : scalar in [-1,1] estimating goodness for the *player*.
-    """
-    ACTIONS = 4  # up, right, down, left
-
-    def __init__(self, n=4, m=4, k=20, filters=FILTERS, blocks=BLOCKS, model: nn.Module = None):
-        super(ZeroModelNN, self).__init__()
-        self.model = model if model else ZeroNetwork(n, m, k, filters, blocks)
-
-    def eval(self):
-        self.model.eval()
-
-    def set_model(self, model: nn.Module):
-        self.model = model
-
-    def save(self, path = None):
-        if path is None:
-            path = "model.pth"
-        self.model.save(path)
-
-    def infer(self, board: BoardType) -> ZeroProbs:
-        # convert board into one-hot encoding, where board is currently nxm with value in each square
-        # should be 1xnxmxk with k=20 (max tile) with a 1 in the square of the value, else 0
-        model_input = to_one_hot(board, 20)
-        # convert to tensor
-        model_input = torch.from_numpy(model_input).float().to('mps')
-        # run through model
-        with torch.no_grad():
-            priors, value = self.model(model_input)
-        # convert to numpy
-        priors = priors.cpu().numpy()[0]
-        value = value.cpu().numpy()[0]
-        # convert to list
-        priors = priors.tolist()
-        return priors, float(value)
-
-
 C_PUCT = math.sqrt(2)  # exploration constant (tune later)
 
 class ZeroMCTSNode:
@@ -128,20 +37,20 @@ class ZeroMCTSNode:
     def __init__(
         self,
         node_type: int,
-        model: ZeroModel,
+        model: ZeroNetwork,
         rules: GameRules,
         state: GameState,
         parent: Optional["ZeroMCTSNode"] = None,
     ) -> None:
         self.parent: Optional[ZeroMCTSNode] = parent
         self.type: int = node_type
-        self.model: ZeroModel = model
+        self.model: ZeroNetwork = model
         self.rules: GameRules = rules
         self.state: GameState = state
 
         # children: key -> child node
         #   key == int (direction)  when PLAYER node
-        #   key == (r,c,val)        when CHANCE node
+        #   key == bytes            when CHANCE node (using board.tobytes())
         self.children: Dict[Any, "ZeroMCTSNode"] = {}
 
         # statistics
@@ -152,7 +61,8 @@ class ZeroMCTSNode:
         if self.type == self.PLAYER:
             self.valid_moves: List[int] = rules.get_valid_moves(state.board)
             # priors fixed at expansion time
-            self.priors, _ = model.infer(state.board)
+            self.priors, _ = model.infer(np.expand_dims(state.board, axis=0))
+            self.priors = self.priors[0]  # remove batch dim
             # mask illegal moves to zero prob, renormalise
             total_p = 0.0
             for a in range(4):
@@ -161,15 +71,17 @@ class ZeroMCTSNode:
                 total_p += self.priors[a]
             if total_p == 0:
                 # all moves illegal (should be terminal) – avoid div/0
-                self.priors = [1e-8] * 4
+                self.priors = np.array([1e-8] * 4)
                 total_p = 4e-8
-            self.priors = [p / total_p for p in self.priors]
+            self.priors = self.priors / total_p
         else:
             self.valid_moves = []  # unused
-            self.priors = []      # unused
+            self.priors = np.array([])      # unused
 
     def get_probs(self)-> ZeroProbs:
-        p = [child.visits for child in self.children.values()]
+        p = []
+        for i in range(4):
+            p.append(self.children[i].visits if i in self.children else 0)
         # debug:
         assert sum(p) == self.visits, "visits don't match"
         p = [x/self.visits for x in p]
@@ -228,7 +140,7 @@ class ZeroPlayer:
         action = player.play(start_state, time_limit=0.1)
     """
 
-    def __init__(self, model: ZeroModel, rules: GameRules, dirichlet_eps: float = 0.25, dirichlet_alpha: float = 0.3):
+    def __init__(self, model: ZeroNetwork, rules: GameRules, dirichlet_eps: float = 0.25, dirichlet_alpha: float = 0.3):
         self.model = model
         self.rules = rules
         self.dir_eps = dirichlet_eps
@@ -280,8 +192,9 @@ class ZeroPlayer:
         if node.is_terminal:
             max_tile = self.rules.get_max_tile(node.state.board)
             return math.log2(node.state.score) # same scaling as model
-        _, value = self.model.infer(node.state.board)
-        return float(value)
+        board_np = np.expand_dims(node.state.board, axis=0)
+        _, value = self.model.infer(board_np)
+        return float(value.item())
 
     def _backprop(self, path: List[ZeroMCTSNode], leaf_value: float):
         for n in reversed(path):
@@ -290,7 +203,7 @@ class ZeroPlayer:
             # no sign flip – single player
 
 class ZeroTrainer:
-    def __init__(self, model: ZeroModelNN, rules: GameRules, player: Optional[ZeroPlayer] = None):
+    def __init__(self, model: ZeroNetwork, rules: GameRules, player: Optional[ZeroPlayer] = None):
         self.model = model
         self.rules = rules
         self.player = ZeroPlayer(model, rules) if player is None else player
@@ -298,12 +211,11 @@ class ZeroTrainer:
     def train(self, epochs: int, batch_size: int, **kwargs):
         if not os.path.exists("checkpoints"):
             os.makedirs("checkpoints")
-        model = self.model.model
-        model.train()
-        model = model.to('mps')
-        optimizer = torch.optim.SGD(self.model.model.parameters(), lr=0.01, momentum=0.9)
+        model = self.model
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
 
         for epoch in range(epochs):
+            model.eval()
             samples = []
             epoch_stats = {
                 'max_score': 0,
@@ -329,7 +241,7 @@ class ZeroTrainer:
                 # play until terminal
                 while not self.rules.is_terminal(state.board):
                     turn_count += 1
-                    action, (pi_probs, value_est) = self.player.play(state, simulations=1000)
+                    action, (pi_probs, value_est) = self.player.play(state, simulations=10)
                     trajectory.append((state, pi_probs))
 
                     # Update progress bar with current game stats
@@ -373,6 +285,7 @@ class ZeroTrainer:
             ## GPU HEAVY
             # Training step
             if samples:
+                model.train()
                 states, pis, zs = zip(*samples)
                 boards = [to_one_hot(state.board, 20)[0] for state in states]
                 state_tensor = torch.tensor(np.stack(boards), dtype=torch.float32).to('mps')
@@ -402,7 +315,7 @@ class ZeroTrainer:
 
 if __name__ == "__main__":
     rules = GameRules()
-    model = ZeroModel()
+    model = ZeroNetwork(4,4,20)
     agent = ZeroPlayer(model, rules)
 
     runner = game_runner = __import__("game_alt").GameRunner(rules)
