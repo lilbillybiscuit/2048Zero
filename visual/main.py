@@ -1,5 +1,5 @@
-from game import Simplified2048Adapter
-from interface import PygameInterface
+from visual.game import Simplified2048Adapter
+from visual.interface import PygameInterface
 import random
 import numpy as np
 

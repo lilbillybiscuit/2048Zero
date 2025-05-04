@@ -25,7 +25,7 @@ except ImportError:
     np = None
 
 # ------- import your own modules ---------------------------------
-from game import Game2048Animation          # <-- change to the right name
+from visual.game import Game2048Animation          # <-- change to the right name
 from test_minmax import expectimax        # (depth defaults to 3)
 
 

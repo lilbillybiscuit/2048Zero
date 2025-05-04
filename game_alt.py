@@ -6,9 +6,75 @@ from typing import Dict, List, Tuple, Optional, Any, NamedTuple, Union
 
 BoardType = np.ndarray[Any, np.dtype[np.int64]]
 
+class BitBoard:
+    """Optimized board representation using bit operations for fast processing"""
+    @staticmethod
+    def from_numpy(board: BoardType) -> int:
+        height, width = board.shape
+        bitboard = 0
+        shift = 0
+
+        for r in range(height):
+            for c in range(width):
+                value = min(int(board[r, c]), 15)
+                bitboard |= (value & 0xF) << shift
+                shift += 4
+
+        return bitboard
+
+    @staticmethod
+    def to_numpy(bitboard: int, height: int, width: int) -> BoardType:
+        board = np.zeros((height, width), dtype=np.int64)
+
+        for r in range(height):
+            for c in range(width):
+                idx = r * width + c
+                shift = idx * 4
+                value = (bitboard >> shift) & 0xF
+                board[r, c] = value
+
+        return board
+
+    @staticmethod
+    @numba.njit
+    def fast_has_valid_moves(bitboard: int, height: int, width: int) -> bool:
+        # Check for empty cells
+        for i in range(height * width):
+            shift = i * 4
+            value = (bitboard >> shift) & 0xF
+            if value == 0:
+                return True
+
+        # Check for mergeable horizontal cells
+        for r in range(height):
+            for c in range(width - 1):
+                idx1 = r * width + c
+                idx2 = r * width + (c + 1)
+                shift1 = idx1 * 4
+                shift2 = idx2 * 4
+                value1 = (bitboard >> shift1) & 0xF
+                value2 = (bitboard >> shift2) & 0xF
+                if value1 != 0 and value1 == value2:
+                    return True
+
+        # Check for mergeable vertical cells
+        for c in range(width):
+            for r in range(height - 1):
+                idx1 = r * width + c
+                idx2 = (r + 1) * width + c
+                shift1 = idx1 * 4
+                shift2 = idx2 * 4
+                value1 = (bitboard >> shift1) & 0xF
+                value2 = (bitboard >> shift2) & 0xF
+                if value1 != 0 and value1 == value2:
+                    return True
+
+        return False
+
 class GameState(NamedTuple):
-    board: BoardType
-    score: np.int64
+    board: BoardType  # NumPy representation of the board
+    score: np.int64   # Current game score
+    bitboard: Optional[int] = None  # Optional bitboard representation for efficiency
 
 @numba.njit(cache=True)
 def _process_line_numba(line: BoardType) -> Tuple[BoardType, np.int64]:
@@ -29,9 +95,11 @@ def _process_line_numba(line: BoardType) -> Tuple[BoardType, np.int64]:
             continue
 
         if target_idx > 0 and new_line[target_idx - 1] == val and not last_merged:
-            merged_val = val * 2
+            # When merging, increment the exponent by 1 (equivalent to multiplying by 2)
+            merged_val = val + 1
             new_line[target_idx - 1] = merged_val
-            merge_score += merged_val
+            # Score uses the actual value (2^exponent)
+            merge_score += np.int64(1 << merged_val) if merged_val > 0 else np.int64(0)
             last_merged = True
         else:
             new_line[target_idx] = val
@@ -111,6 +179,7 @@ def _add_random_tile_numba(board: BoardType, spawn_values: np.ndarray, spawn_wei
     # Numba doesn't support random.choices directly with weights
     # Workaround using cumulative weights and random.random()
     choice_idx = np.searchsorted(np.cumsum(spawn_weights), random.random(), side="right")
+    # Use exponents: 2^1=2, 2^2=4
     val = spawn_values[choice_idx]
 
     return r, c, val
@@ -122,7 +191,9 @@ class GameRules:
     DOWN: int = 2
     LEFT: int = 3
     DIRECTIONS: List[int] = [UP, RIGHT, DOWN, LEFT]
-    DEFAULT_SPAWN_RATES: Dict[int, float] = {2: 0.9, 4: 0.1}
+    DIRECTION_NAMES: Dict[int, str] = {UP: "UP", RIGHT: "RIGHT", DOWN: "DOWN", LEFT: "LEFT"}
+    # Exponents: 2^1=2, 2^2=4
+    DEFAULT_SPAWN_RATES: Dict[int, float] = {1: 0.9, 2: 0.1}
 
     height: int
     width: int
@@ -164,19 +235,21 @@ class GameRules:
         max_tiles = self.height * self.width
         actual_initial_tiles = min(self.num_initial_tiles, max_tiles)
 
-        new_board = board
+        # Do a single copy of the board at the beginning
+        new_board = board.copy()
         for _ in range(actual_initial_tiles):
             # Directly call the tile adding logic without modifying instance state
             spawn_result = _add_random_tile_numba(new_board, self._spawn_values_np, self._spawn_weights_np)
             if spawn_result:
                 r, c, val = spawn_result
-                temp_board = new_board.copy() # Create copy before modification
-                temp_board[r, c] = val
-                new_board = temp_board # Update reference
+                # Modify board in-place - we already made a copy at the beginning
+                new_board[r, c] = val
             else:
                 break # Should not happen with initial empty board if max_tiles respected
 
-        return GameState(new_board, score)
+        # Create bitboard representation for better performance
+        bitboard = BitBoard.from_numpy(new_board)
+        return GameState(new_board, score, bitboard)
 
     def apply_move(self, board: BoardType, direction: int) -> Tuple[BoardType, np.int64]:
         assert 0 <= direction <= 3
@@ -194,15 +267,24 @@ class GameRules:
         return board_changed, score_gain, new_board
 
     def get_valid_moves(self, board: BoardType) -> List[int]:
+        # First check with BitBoard if any moves are available at all
+        bitboard = BitBoard.from_numpy(board)
+        if not BitBoard.fast_has_valid_moves(bitboard, self.height, self.width):
+            return []
+            
+        # If moves are available, determine which specific directions are valid
         valid_moves: List[int] = []
         for direction in self.DIRECTIONS:
             board_changed, _, _ = self.simulate_move(board, direction)
             if board_changed:
                 valid_moves.append(direction)
+                
         return valid_moves
 
     def is_terminal(self, board: BoardType) -> bool:
-        return not _check_if_any_moves_possible_numba(board)
+        # Use the BitBoard for faster terminal state checking
+        bitboard = BitBoard.from_numpy(board)
+        return not BitBoard.fast_has_valid_moves(bitboard, self.height, self.width)
 
     def add_random_tiles(self, board: BoardType, return_action=False) -> Union[Tuple[BoardType, List[Tuple[int]]], BoardType]:
         """
@@ -232,7 +314,13 @@ class GameRules:
     def get_max_tile(self, board: BoardType) -> np.int64:
          if board.size == 0:
              return np.int64(0)
-         return np.max(board)
+         max_exponent = np.max(board)
+         # Return the actual value (2^exponent)
+         return np.int64(1 << max_exponent) if max_exponent > 0 else np.int64(0)
+         
+    def get_direction_name(self, direction: int) -> str:
+        """Returns the name of the direction as a string."""
+        return self.DIRECTION_NAMES.get(direction, f"UNKNOWN({direction})")
 
     def render_ascii(self, board: BoardType, cell_width: int = 6) -> str:
         separator: str = "+" + ("-" * cell_width + "+") * self.width
@@ -240,7 +328,9 @@ class GameRules:
         for r in range(self.height):
             row_str: List[str] = ["|"]
             for c in range(self.width):
-                val: np.int64 = board[r, c]
+                exponent: np.int64 = board[r, c]
+                # Display actual value (2^exponent), but only if exponent > 0
+                val = (1 << exponent) if exponent > 0 else 0
                 cell_str: str = str(val) if val != 0 else "."
                 row_str.append(cell_str.center(cell_width))
                 row_str.append("|")
@@ -341,13 +431,16 @@ if __name__ == "__main__":
     print(game.render_ascii())
     print(f"Score: {game.get_score()}")
     print(f"Game Over: {game.is_game_over()}")
-    print(f"Valid Moves: {game.get_valid_moves()}")
+    valid_moves = game.get_valid_moves()
+    valid_move_names = [game.rules.get_direction_name(move) for move in valid_moves]
+    print(f"Valid Moves: {valid_move_names}")
 
     valid_moves_initial = game.get_valid_moves()
     chosen_move = GameRules.DOWN if GameRules.DOWN in valid_moves_initial else (valid_moves_initial[0] if valid_moves_initial else -1)
 
     if chosen_move != -1:
-        print(f"\nAttempting move: {chosen_move}")
+        move_name = game.rules.get_direction_name(chosen_move)
+        print(f"\nAttempting move: {move_name}")
         score_gain, total_score = game.move(chosen_move)
         print(f"Score Gain: {score_gain}, New Total Score: {total_score}")
         if score_gain > 0 or np.count_nonzero(game.current_board == 0) > 0:
@@ -361,7 +454,9 @@ if __name__ == "__main__":
         print(game.render_ascii())
         print(f"Score: {game.get_score()}")
         print(f"Game Over: {game.is_game_over()}")
-        print(f"Valid Moves: {game.get_valid_moves()}")
+        valid_moves = game.get_valid_moves()
+        valid_move_names = [game.rules.get_direction_name(move) for move in valid_moves]
+        print(f"Valid Moves: {valid_move_names}")
     else:
         print("\nNo valid moves initially.")
     print("-" * 40)
@@ -403,7 +498,6 @@ if __name__ == "__main__":
     print(game_custom.render_ascii(cell_width=5))
     print(f"Score: {game_custom.get_score()}")
 
-    move_names: Dict[int, str] = {0: "Up", 1: "Right", 2: "Down", 3: "Left"}
     turn: int = 0
     while not game_custom.is_game_over():
         turn += 1
@@ -413,7 +507,8 @@ if __name__ == "__main__":
              break
 
         chosen_move: int = random.choice(valid_moves)
-        print(f"\nTurn {turn}: Action: {move_names[chosen_move]} (Valid: {valid_moves})")
+        valid_move_names = [game_custom.rules.get_direction_name(move) for move in valid_moves]
+        print(f"\nTurn {turn}: Action: {game_custom.rules.get_direction_name(chosen_move)} (Valid: {valid_move_names})")
 
         board_before = game_custom.get_board()
         gain, _ = game_custom.move(chosen_move)
@@ -478,11 +573,12 @@ if __name__ == "__main__":
 
     valid_moves = rules.get_valid_moves(start_state.board)
     if valid_moves:
-        print(f"Valid moves from start state: {valid_moves}")
+        valid_move_names = [rules.get_direction_name(move) for move in valid_moves]
+        print(f"Valid moves from start state: {valid_move_names}")
         # Simulate taking the first valid move
         chosen_move = valid_moves[0]
         changed, gain, board_after_move = rules.simulate_move(start_state.board, chosen_move)
-        print(f"\nSimulating move {chosen_move}: Changed={changed}, Gain={gain}")
+        print(f"\nSimulating move {rules.get_direction_name(chosen_move)}: Changed={changed}, Gain={gain}")
         print("Board after move:")
         print(rules.render_ascii(board_after_move))
 

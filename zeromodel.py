@@ -51,7 +51,7 @@ class ZeroNetwork(nn.Module):
         self.n = n
         self.m = m
         self.k = k
-        # input = k * n * m, where k is 2^k (max tile), n and m are dimensions
+        # input = k * n * m, where k is max exponent + 1 (for 0), n and m are dimensions
         self.conv1 = nn.Conv2d(in_channels=k, out_channels=filters, kernel_size=3, padding=1) # -> F x n x m
         self.conv2 = nn.Conv2d(in_channels=filters, out_channels=filters, kernel_size=3, padding=1)
 
@@ -108,9 +108,13 @@ class ZeroNetwork(nn.Module):
         oh = F.one_hot(onehot, num_classes=self.k).permute(0,3,1,2).float()
         return oh
 
-    def infer(self, board: np.ndarray) -> Tuple[List[float], float]:
+    def infer(self, board: np.ndarray) -> Tuple[np.ndarray, float]:
         batch_size = len(board)
         p, v= self.forward(self._to_onehot(board))
         p = p.detach().cpu().reshape(batch_size, 4).numpy()
         v = v.detach().cpu().reshape(batch_size).numpy()
         return p, v
+
+    def save(self, path: str):
+        torch.save(self.state_dict(), path)
+        print(f"Model saved to {path}")
