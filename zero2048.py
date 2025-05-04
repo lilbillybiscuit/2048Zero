@@ -13,15 +13,21 @@ import os
 from game_alt import GameRules, GameState, BoardType
 from model import ZeroNetwork
 import torch
+import multiprocessing
 
 __all__ = [
     "ZeroModel",
     "ZeroMCTSNode",
     "ZeroPlayer",
 ]
+device = 'cpu'
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+elif torch.backends.cuda.is_available():
+    device = torch.device("cuda")
 
 ZeroProbs = Tuple[List[float], float]
-FILTERS, BLOCKS=64, 8
+FILTERS, BLOCKS=8, 1
 
 # BoardType = np.ndarray[Any, np.dtype[np.int64]]
 
@@ -40,34 +46,38 @@ class ZeroModel:
 
     def infer(self, board: BoardType) -> ZeroProbs:
         # *** Replace this with real NN inference ***
-        priors = [1.0 / self.ACTIONS] * self.ACTIONS  # uniform policy
-        # simple heuristic value: log2(max_tile)/11 ∈ [0,1]; scale to [-1,1]
-        max_tile = board.max(initial=0)
-        value = math.log2(max_tile + 1) / 11.0 * 2 - 1
-        return priors, float(value)
+        raise NotImplementedError
+        # priors = [1.0 / self.ACTIONS] * self.ACTIONS  # uniform policy
+        # # simple heuristic value: log2(max_tile)/11 ∈ [0,1]; scale to [-1,1]
+        # max_tile = board.max(initial=0)
+        # value = math.log2(max_tile + 1) / 11.0 * 2 - 1
+        # return priors, float(value)
+
 
 @numba.njit(cache=True)
-def to_one_hot_inplace(board: BoardType, result:np.ndarray, index, n, m, k:int) -> None:
+def to_one_hot_inplace(board: BoardType, result: np.ndarray, idx, n, m, k: int) -> None:
     for i in range(n):
         for j in range(m):
             tile_value = board[i, j]
             if tile_value > 0:
-                index = int(tile_value).bit_length() - 1
-                if 1 <= index < k:
-                    result[index, index, i, j] = 1.0
-                pass
+                channel_idx = int(math.log2(tile_value) - 1 + 0.001)
+                if 1 <= channel_idx < k:
+                    result[channel_idx, i, j] = 1.0
 
-@numba.njit(cache=True)
+
 def to_one_hot(board: Union[BoardType, List[BoardType]], k: int) -> np.ndarray:
-    n, m = board.shape # n = height (rows), m = width (cols)
-    # Standard shape: (batch, channels, height, width)
-    if isinstance(board, BoardType):
+    if not isinstance(board, list):
         board = [board]
-    one_hot = np.zeros((len(board), k, n, m), dtype=np.float16)
+
+    n, m = board[0].shape  # n = height (rows), m = width (cols)
+    # Standard shape: (batch, channels, height, width)
+    one_hot = np.zeros((len(board), k, n, m), dtype=np.float32)
+
     for i, b in enumerate(board):
-        # one-hot encoding
         to_one_hot_inplace(b, one_hot[i], 0, n, m, k)
+
     return one_hot
+
 class ZeroModelNN(ZeroModel):
     """Policy‑Value network interface.
 
@@ -97,13 +107,13 @@ class ZeroModelNN(ZeroModel):
         # should be 1xnxmxk with k=20 (max tile) with a 1 in the square of the value, else 0
         model_input = to_one_hot(board, 20)
         # convert to tensor
-        model_input = torch.from_numpy(model_input).float()
+        model_input = torch.from_numpy(model_input).float().to('mps')
         # run through model
         with torch.no_grad():
             priors, value = self.model(model_input)
         # convert to numpy
-        priors = priors.numpy()[0]
-        value = value.numpy()[0]
+        priors = priors.cpu().numpy()[0]
+        value = value.cpu().numpy()[0]
         # convert to list
         priors = priors.tolist()
         return priors, float(value)
@@ -286,56 +296,107 @@ class ZeroTrainer:
         self.player = ZeroPlayer(model, rules) if player is None else player
 
     def train(self, epochs: int, batch_size: int, **kwargs):
-        # if os.path.exists("checkpoints/model.pth"):
-        #     self.model.load("checkpoints/model.pth")
-        #
         if not os.path.exists("checkpoints"):
             os.makedirs("checkpoints")
         model = self.model.model
         model.train()
+        model = model.to('mps')
         optimizer = torch.optim.SGD(self.model.model.parameters(), lr=0.01, momentum=0.9)
-        for epoch in tqdm(range(epochs)):
+
+        for epoch in range(epochs):
             samples = []
-            for _ in range(batch_size):
+            epoch_stats = {
+                'max_score': 0,
+                'max_tile': 0,
+                'max_turns': 0,
+                'total_score': 0,
+                'total_tile': 0,
+                'total_turns': 0,
+                'games': 0
+            }
+
+            # CPU HEAVY
+
+            # Use tqdm for the games in each epoch
+            game_pbar = tqdm(range(batch_size), desc=f'Epoch {epoch + 1}/{epochs}')
+
+
+            for game_idx in game_pbar:
                 state = self.rules.get_initial_state()
                 trajectory = []
+                turn_count = 0
 
                 # play until terminal
                 while not self.rules.is_terminal(state.board):
-                    action, (pi_probs, _value_est) = self.player.play(state, simulations=10000)
+                    turn_count += 1
+                    action, (pi_probs, value_est) = self.player.play(state, simulations=1000)
                     trajectory.append((state, pi_probs))
+
+                    # Update progress bar with current game stats
+                    max_tile = self.rules.get_max_tile(state.board)
+                    game_pbar.set_postfix(
+                        game=f"{game_idx + 1}/{batch_size}",
+                        turn=turn_count,
+                        score=state.score,
+                        max_tile=max_tile,
+                        val_est=f"{value_est:.2f}"
+                    )
+
                     new_board, gain = self.rules.apply_move(state.board, action)
                     new_board = self.rules.add_random_tiles(new_board)
                     state = GameState(new_board, state.score + gain)
 
+                # Game completed - record final stats
                 max_tile = self.rules.get_max_tile(state.board)
                 z = math.log2(int(max_tile) + 1) / 11.0 * 2 - 1  # scaled into [-1,1]
-                print("max tile:", max_tile, "z:", z)
 
+                # Update epoch statistics
+                epoch_stats['games'] += 1
+                epoch_stats['max_score'] = max(epoch_stats['max_score'], state.score)
+                epoch_stats['max_tile'] = max(epoch_stats['max_tile'], max_tile)
+                epoch_stats['max_turns'] = max(epoch_stats['max_turns'], turn_count)
+                epoch_stats['total_score'] += state.score
+                epoch_stats['total_tile'] += max_tile
+                epoch_stats['total_turns'] += turn_count
+
+                # Add to training samples
                 for (s_t, pi_t) in trajectory:
                     samples.append((s_t, pi_t, z))
 
-            states, pis, zs = zip(*samples)
-            boards = [to_one_hot(state.board, 20)[0] for state in states]
-            state_tensor = torch.tensor(np.stack(boards), dtype=torch.float32)
+            # Calculate averages
+            avg_score = epoch_stats['total_score'] / epoch_stats['games'] if epoch_stats['games'] > 0 else 0
+            avg_tile = epoch_stats['total_tile'] / epoch_stats['games'] if epoch_stats['games'] > 0 else 0
+            avg_turns = epoch_stats['total_turns'] / epoch_stats['games'] if epoch_stats['games'] > 0 else 0
 
-            pi_tensor = torch.tensor(pis, dtype=torch.float32) # N x 4
+            ## END CPU HEAVY
 
-            z_tensor = torch.tensor(zs, dtype=torch.float32).unsqueeze(1) # N x 1
+            ## GPU HEAVY
+            # Training step
+            if samples:
+                states, pis, zs = zip(*samples)
+                boards = [to_one_hot(state.board, 20)[0] for state in states]
+                state_tensor = torch.tensor(np.stack(boards), dtype=torch.float32).to('mps')
+                pi_tensor = torch.tensor(pis, dtype=torch.float32).to('mps')  # N x 4
+                z_tensor = torch.tensor(zs, dtype=torch.float32).unsqueeze(1).to('mps')  # N x 1
 
-            optimizer.zero_grad()
-            p_pred, v_pred = model(state_tensor)
-            policy_loss = -(pi_tensor * torch.log(p_pred + 1e-8)).sum(dim=1).mean()
-            value_loss = torch.nn.functional.mse_loss(v_pred, z_tensor)
-            loss = policy_loss + value_loss
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad()
+                p_pred, v_pred = model(state_tensor)
+                policy_loss = -(pi_tensor * torch.log(p_pred + 1e-8)).sum(dim=1).mean()
+                value_loss = torch.nn.functional.mse_loss(v_pred, z_tensor)
+                loss = policy_loss + value_loss
+                loss.backward()
+                optimizer.step()
 
-            print(f"Epoch {epoch}: loss={loss.item():.4f} (π:{policy_loss:.4f}, v:{value_loss:.4f})")
-
+                # Create a summary tqdm bar for the epoch results
+                epoch_summary = tqdm(total=0, bar_format='{desc}',
+                                     desc=f"Epoch {epoch + 1}: loss={loss.item():.4f} (π:{policy_loss:.4f}, v:{value_loss:.4f}) | "
+                                          f"MaxTile: {epoch_stats['max_tile']} | MaxScore: {epoch_stats['max_score']} | "
+                                          f"AvgTile: {avg_tile:.1f} | AvgScore: {avg_score:.1f} | AvgTurns: {avg_turns:.1f}")
+                epoch_summary.close()
+            ## END GPU HEAVY
+            # Save checkpoints
             if epoch % 10 == 0:
                 self.model.save(f"checkpoints/model_epoch_{epoch}.pth")
-
 
 
 
