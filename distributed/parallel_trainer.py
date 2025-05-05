@@ -408,13 +408,13 @@ class ParallelZeroTrainer:
             # Calculate epoch time
             epoch_time = time.time() - epoch_start_time
             
-            # Report results
-            temp_stats = EpochStats(self.rules.height, self.rules.width)
-            print_epoch_summary(
-                temp_stats,  # Temporary stats object for formatting
-                epoch, epochs, loss, pi_loss, v_loss,
-                scheduler.get_last_lr()[0] if scheduler else None
-            )
+            # Print a summary of the epoch results
+            max_tile = epoch_stats.get('max_tile', 0)
+            max_score = epoch_stats.get('max_score', 0)
+            avg_score = epoch_stats.get('total_score', 0) / max(1, epoch_stats.get('games', 1))
+            loss_str = f"{loss:.4f}" if loss is not None else "N/A"
+            print(f"Epoch {epoch+1} summary: MaxTile={max_tile}, MaxScore={max_score}, " +
+                  f"AvgScore={avg_score:.1f}, Loss={loss_str}, Time={epoch_time:.1f}s")
             
             # Prepare epoch data for run tracker
             epoch_data = {

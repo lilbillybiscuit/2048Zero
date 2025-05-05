@@ -195,7 +195,7 @@ class MultiprocessSelfPlayWorker:
             except FileNotFoundError:
                 pass
         
-        # Update total samples count
+        # Update total samples count for wandb tracking
         combined_stats['samples'] = len(all_samples)
         
         # Calculate elapsed time and throughput
@@ -294,9 +294,8 @@ class MultiprocessSelfPlayWorker:
                         board=game_stats['final_board']
                     )
                     
-                    # Only print for first game and every 5th game after
-                    if game_idx == 0 or (game_idx + 1) % 5 == 0:
-                        print(f"W{worker_id}: {game_idx+1}/{num_games} games")
+                    # Print when a game is completed with score and max tile
+                    print(f"W{worker_id} Game {game_idx+1}/{num_games} - Score: {game_stats['score']}, Max Tile: {game_stats['max_tile']}")
                     
                 except Exception as game_error:
                     print(f"Worker {worker_id}, Game {game_idx} failed: {game_error}")
