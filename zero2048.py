@@ -1,22 +1,19 @@
 from __future__ import annotations
 
-import time
 import math
-import random
-import numpy as np
-from dataclasses import dataclass
-from typing import List, Tuple, Any, Dict, Optional, Union
-from torch import nn
-import numba
-from tqdm import tqdm
 import os
-import json
+import random
+import time
 from datetime import datetime
-from game_alt import GameRules, GameState, BoardType, BitBoard, GameRunner
+from typing import List, Tuple, Any, Dict, Optional
+
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from game_alt import GameRules, GameState, BitBoard, GameRunner
 from zeromodel import ZeroNetwork
 from zeromonitoring import ZeroMonitor, EpochStats, print_epoch_summary
-import torch
-import multiprocessing
 
 __all__ = [
     "ZeroMCTSNode",
@@ -25,7 +22,7 @@ __all__ = [
 device = 'cpu'
 if torch.backends.mps.is_available():
     device = torch.device("mps")
-elif torch.backends.cuda.is_available():
+elif torch.cuda.is_available():
     device = torch.device("cuda")
 
 ZeroProbs = Tuple[List[float], float]
