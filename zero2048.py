@@ -650,7 +650,7 @@ class ZeroTrainer:
 if __name__ == "__main__":
     # Run a simple demo game
     rules = GameRules(num_spawn_tiles_per_move=1)
-    model = ZeroNetwork(4, 4, 16) 
+    model = ZeroNetwork(4, 4, 16, infer_device=device)
     agent = ZeroPlayer(model, rules)
     runner = GameRunner(rules)
     
