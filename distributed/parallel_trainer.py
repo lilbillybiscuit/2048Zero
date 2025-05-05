@@ -53,7 +53,7 @@ class ParallelZeroTrainer:
         
         # Set number of workers (default to CPU count)
         self.device_manager = DeviceManager()
-        self.num_workers = num_workers if num_workers is not None else min(8, os.cpu_count())
+        self.num_workers = num_workers if num_workers is not None else os.cpu_count()
         
         # Generate experiment name if none provided
         if experiment_name is None:
