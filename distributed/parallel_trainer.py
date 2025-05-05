@@ -53,8 +53,7 @@ class ParallelZeroTrainer:
         seed_everything(seed)
         
         # Set up device manager first to get GPU count
-        # Don't allow silent fallback to CPU - if CUDA is requested but not available, raise an error
-        self.device_manager = DeviceManager(allow_cpu_fallback=False)
+        self.device_manager = DeviceManager()
         
         # Set number of workers
         if num_workers is not None:
@@ -199,29 +198,15 @@ class ParallelZeroTrainer:
         """
         self.model.train()
         
-        # Move model to best available device for training with timeout protection
+        # Move model to best available device
         device = self.device_manager.get_best_device()
-        try:
-            if device.startswith('cuda'):
-                with cuda_operation_timeout(seconds=30):
-                    self.model.to(device)
-            else:
-                self.model.to(device)
-                
-            print(f"Training on device: {device}")
-        except TimeoutException as e:
-            # Don't fall back to CPU - raise an exception if CUDA timeout occurs
-            error_msg = f"Model transfer to {device} timed out: {e}"
-            print(f"ERROR: {error_msg}")
-            raise RuntimeError(error_msg)
-            
-        # Log GPU memory usage if using CUDA
+        
+        # Use timeout protection for CUDA devices
         if device.startswith('cuda'):
-            from .cuda_utils import get_cuda_memory_usage
-            device_idx = int(device.split(':')[1]) if ':' in device else 0
-            memory_stats = get_cuda_memory_usage(device_idx)
-            print(f"GPU memory: {memory_stats['allocated_mb']:.1f}MB allocated, "
-                  f"{memory_stats['reserved_mb']:.1f}MB reserved")
+            with cuda_operation_timeout(seconds=30):
+                self.model.to(device)
+        else:
+            self.model.to(device)
 
         random.shuffle(samples)
 
@@ -385,7 +370,7 @@ class ParallelZeroTrainer:
             epoch_start_time = time.time()
             
             # 1. Collect training data with parallel self-play
-            print(f"Epoch {epoch+1}/{epochs}: Collecting self-play data with {self.num_workers} workers...")
+            print(f"Epoch {epoch+1}/{epochs}")
             self.model.eval()  # Set to evaluation mode for self-play
             
             samples, epoch_stats = self._collect_selfplay_data_parallel(
@@ -399,7 +384,6 @@ class ParallelZeroTrainer:
             # 2. Update neural network if samples were collected
             loss, pi_loss, v_loss = None, None, None
             if samples:
-                print(f"Training on {len(samples)} samples with batch size {batch_size}...")
                 # Update network with batched training
                 loss, pi_loss, v_loss = self._update_network(
                     samples, optimizer, batch_size, epoch=epoch

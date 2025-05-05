@@ -126,8 +126,8 @@ class MultiprocessSelfPlayWorker:
         # Create temp directory if it doesn't exist
         os.makedirs(self.temp_dir, exist_ok=True)
         
-        # Initialize device manager with no fallback to CPU
-        self.device_manager = DeviceManager(allow_cpu_fallback=False)
+        # Initialize device manager
+        self.device_manager = DeviceManager()
         
     def generate_games(self) -> Tuple[List[Any], Dict[str, Any]]:
         """
@@ -158,11 +158,7 @@ class MultiprocessSelfPlayWorker:
             ))
         
         # Launch worker processes
-        print(f"Launching {self.num_workers} self-play worker processes")
         start_time = time.time()
-        
-        # Create a fresh process pool with the 'spawn' method for CUDA compatibility
-        # The 'fork' method can cause issues with CUDA
         ctx = multiprocessing.get_context('spawn')
         with ctx.Pool(self.num_workers) as pool:
             pool.starmap(self._worker_process, worker_args)
@@ -208,9 +204,7 @@ class MultiprocessSelfPlayWorker:
         combined_stats['games_per_second'] = combined_stats['games'] / elapsed_time if elapsed_time > 0 else 0
         combined_stats['samples_per_second'] = len(all_samples) / elapsed_time if elapsed_time > 0 else 0
         
-        print(f"Parallel self-play complete - {combined_stats['games']} games, "
-              f"{len(all_samples)} samples in {elapsed_time:.1f}s "
-              f"({combined_stats['samples_per_second']:.1f} samples/s)")
+        print(f"Self-play: {combined_stats['games']} games, {len(all_samples)} samples, {elapsed_time:.1f}s")
         
         return all_samples, combined_stats
     
@@ -251,42 +245,21 @@ class MultiprocessSelfPlayWorker:
             model = ZeroNetwork(rules.height, rules.width, 16)  # 16 for max tile exponent
             model.load_state_dict(torch.load(model_path, map_location='cpu'))
             
-            # If using CUDA, handle possible CUDA initialization issues
+            # Initialize CUDA if needed
             if device.startswith('cuda'):
-                # Extract device index
                 device_idx = int(device.split(':')[1]) if ':' in device else 0
+                from .cuda_utils import setup_cuda_for_worker, cuda_operation_timeout
                 
-                # Use our improved setup_cuda_for_worker function
-                from .cuda_utils import setup_cuda_for_worker, cuda_operation_timeout, TimeoutException
+                # Fail if initialization fails
+                setup_cuda_for_worker(device_idx)
                 
-                try:
-                    # Don't allow fallback - raise exception if CUDA initialization fails
-                    setup_cuda_for_worker(device_idx, allow_cpu_fallback=False)
-                    print(f"Worker {worker_id} - CUDA context successfully initialized on device {device}")
-                except Exception as e:
-                    # If we get here, there was a CUDA error and we need to stop the worker
-                    error_msg = f"Worker {worker_id} - CUDA initialization failed: {e}"
-                    print(f"ERROR: {error_msg}")
-                    # Re-raise to stop the worker
-                    raise RuntimeError(error_msg)
-            
-            # Now move model to device with timeout protection
-            try:
-                # This operation can sometimes hang, so we use a timeout
-                if device.startswith('cuda'):
-                    with cuda_operation_timeout(seconds=30):
-                        model = model.to(device)
-                else:
+                # Move model to device with timeout protection
+                with cuda_operation_timeout(seconds=30):
                     model = model.to(device)
+            else:
+                model = model.to(device)
                 
-                model.eval()  # Set to evaluation mode
-            except TimeoutException as e:
-                # Don't fall back to CPU - raise an exception if CUDA timeout occurs
-                error_msg = f"Worker {worker_id} - Model transfer to {device} timed out: {e}"
-                print(f"ERROR: {error_msg}")
-                raise RuntimeError(error_msg)
-            
-            print(f"Worker {worker_id} initialized model on device: {device}")
+            model.eval()
             
             # Create player (original implementation is now thread-safe)
             player = ZeroPlayer(model, rules)
@@ -321,8 +294,9 @@ class MultiprocessSelfPlayWorker:
                         board=game_stats['final_board']
                     )
                     
-                    print(f"Worker {worker_id} completed game {game_idx+1}/{num_games} - "
-                          f"Score: {game_stats['score']}, Max Tile: {game_stats['max_tile']}")
+                    # Only print for first game and every 5th game after
+                    if game_idx == 0 or (game_idx + 1) % 5 == 0:
+                        print(f"W{worker_id}: {game_idx+1}/{num_games} games")
                     
                 except Exception as game_error:
                     print(f"Worker {worker_id}, Game {game_idx} failed: {game_error}")

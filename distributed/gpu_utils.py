@@ -9,25 +9,15 @@ import numpy as np
 class DeviceManager:
     """Manages GPU resources and device assignments"""
     
-    def __init__(self, allow_cpu_fallback: bool = False):
-        """
-        Initialize device manager and detect available devices
-        
-        Args:
-            allow_cpu_fallback: If False, will raise an error if CUDA is requested but not available.
-                               If True, will silently fall back to CPU.
-        """
-        # Store fallback preference
-        self.allow_cpu_fallback = allow_cpu_fallback
-        
+    def __init__(self):
+        """Initialize device manager and detect available devices"""        
         # Detect available CUDA GPUs
         self.num_gpus = torch.cuda.device_count()
         
-        # Check for Apple MPS (Metal Performance Shaders)
+        # Check for Apple MPS
         self.has_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
         
         # Set device options
-        self.devices = []
         if self.num_gpus > 0:
             self.devices = [f'cuda:{i}' for i in range(self.num_gpus)]
         elif self.has_mps:
@@ -35,29 +25,9 @@ class DeviceManager:
         else:
             self.devices = ['cpu']
             
-        # Track device memory info if available
-        self.device_memory = {}
+        # Minimal output with device info
         if self.num_gpus > 0:
-            for i in range(self.num_gpus):
-                props = torch.cuda.get_device_properties(i)
-                self.device_memory[i] = {
-                    'name': props.name,
-                    'total_memory': props.total_memory,
-                    'compute_capability': f"{props.major}.{props.minor}"
-                }
-                
-        # Print available devices
-        if self.num_gpus > 0:
-            print(f"Found {self.num_gpus} CUDA GPU(s):")
-            for i, device in enumerate(self.devices):
-                if i < self.num_gpus:
-                    mem_gb = self.device_memory[i]['total_memory'] / (1024**3)
-                    print(f"  {device}: {self.device_memory[i]['name']} "
-                          f"({mem_gb:.1f} GB, CUDA {self.device_memory[i]['compute_capability']})")
-        elif self.has_mps:
-            print("Found Apple MPS (Metal Performance Shaders)")
-        else:
-            print("No GPUs found, using CPU")
+            print(f"GPUs: {self.num_gpus}")
     
     def assign_device(self, worker_id: int, num_workers: int) -> str:
         """
@@ -71,29 +41,23 @@ class DeviceManager:
             Device string ('cpu', 'cuda:0', 'mps', etc.)
             
         Raises:
-            RuntimeError: If CUDA is requested but not available and allow_cpu_fallback is False
+            RuntimeError: If CUDA is requested but no GPUs are available
         """
-        # If no GPUs or only CPU is available, handle according to fallback preference
-        if not self.devices or (len(self.devices) == 1 and self.devices[0] == 'cpu'):
-            if not self.allow_cpu_fallback and self.num_gpus == 0:
-                raise RuntimeError("CUDA requested but no GPUs are available on this system")
-            return 'cpu'
+        # Fail if no GPUs are available but were requested
+        if self.num_gpus == 0:
+            raise RuntimeError("CUDA requested but no GPUs are available")
         
-        # Special handling for CUDA with multiprocessing
+        # Round-robin assignment across available GPUs
         if self.num_gpus > 0:
-            # Distribute multiple workers evenly across available GPUs
             gpu_index = worker_id % self.num_gpus
             return f'cuda:{gpu_index}'
         
-        # For MPS (Apple Silicon), all can share the same device
+        # Apple MPS fallback
         elif self.has_mps:
             return 'mps'
         
-        # Handle CPU fallback based on preference
-        if self.allow_cpu_fallback:
-            return 'cpu'
-        else:
-            raise RuntimeError("GPU requested but none available")
+        # Should never reach here due to earlier check
+        raise RuntimeError("GPU requested but none available")
     
     def get_best_device(self) -> str:
         """
@@ -103,18 +67,14 @@ class DeviceManager:
             Best device string
             
         Raises:
-            RuntimeError: If CUDA is requested but not available and allow_cpu_fallback is False
+            RuntimeError: If no GPUs are available
         """
         if self.num_gpus > 0:
-            return 'cuda:0'  # Use the first CUDA device
+            return 'cuda:0'
         elif self.has_mps:
-            return 'mps'  # Use Apple MPS
+            return 'mps'
         else:
-            # Handle CPU fallback based on preference
-            if self.allow_cpu_fallback:
-                return 'cpu'
-            else:
-                raise RuntimeError("GPU requested but not available on this system")
+            raise RuntimeError("GPU requested but none available")
 
 
 def seed_everything(seed: int):
