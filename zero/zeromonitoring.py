@@ -423,6 +423,7 @@ class EpochStats:
             'game_max_tiles': [], # Track max tile for each game
             'action_counts': {},  # Track action counts
             'samples': 0,  # Number of samples collected
+            'reward_type': 'score',  # Default reward type is score (not max_tile)
         }
         
         if direction_names:
@@ -491,6 +492,14 @@ class EpochStats:
             num_samples: Number of samples
         """
         self.stats['samples'] = int(num_samples)
+        
+    def update_reward_type(self, reward_type: str):
+        """Update the reward type used
+        
+        Args:
+            reward_type: Name of the reward type (e.g., 'score', 'custom')
+        """
+        self.stats['reward_type'] = str(reward_type)
         
     def get_stats(self) -> Dict[str, Any]:
         """Get the statistics dictionary

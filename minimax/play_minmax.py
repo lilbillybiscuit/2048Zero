@@ -25,8 +25,8 @@ except ImportError:
     np = None
 
 # ------- import your own modules ---------------------------------
-from visual.game import Game2048Animation          # <-- change to the right name
-from test_minmax import expectimax        # (depth defaults to 3)
+from visual.game import Simplified2048Adapter          # <-- change to the right name
+from minimax.test_minmax import expectimax        # (depth defaults to 3)
 
 
 # -----------------------------------------------------------------
@@ -58,7 +58,7 @@ IDX2DIR = ['up', 'right', 'down', 'left']
 # -----------------------------------------------------------------
 def cli_loop():
     """Plain‑text play in the terminal."""
-    game = Game2048Animation()
+    game = Simplified2048Adapter()
     step = 0
 
     while not game.game_over:
@@ -107,7 +107,7 @@ def pygame_loop():
     font_num = pygame.font.SysFont("Helvetica", 36, bold=True)
     font_hud = pygame.font.SysFont("Helvetica", 24)
 
-    game = Game2048Animation()
+    game = Simplified2048Adapter()
     clock = pygame.time.Clock()
     last_ai = 0
 

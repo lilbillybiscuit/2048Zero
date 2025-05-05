@@ -12,12 +12,11 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from game_alt import GameRules
-from zeromodel import ZeroNetwork
-from zeromonitoring import ZeroMonitor, EpochStats, print_epoch_summary
+from zero import GameRules, ZeroNetwork,  ZeroMonitor, EpochStats, print_epoch_summary
+
 from .parallel_selfplay import MultiprocessSelfPlayWorker
 from .gpu_utils import DeviceManager, seed_everything
-from .cuda_utils import cuda_operation_timeout, TimeoutException, safe_cuda_initialization
+from .cuda_utils import cuda_operation_timeout
 
 
 class ParallelZeroTrainer:
@@ -31,7 +30,8 @@ class ParallelZeroTrainer:
         project_name: str = "2048-zero-parallel",
         experiment_name: Optional[str] = None,
         num_workers: int = None,  # Default to CPU count
-        seed: int = 42
+        seed: int = 42,
+        reward_function = None  # Custom reward function
     ):
         """
         Initialize the trainer with model, rules and parallel settings
@@ -44,10 +44,13 @@ class ParallelZeroTrainer:
             experiment_name: Experiment name for wandb
             num_workers: Number of worker processes for parallel self-play
             seed: Random seed for initialization
+            reward_function: Custom function to calculate reward value with signature:
+                            reward_function(state, game_stats) -> (reward_value, reward_name)
         """
         self.model = model
         self.rules = rules
         self.seed = seed
+        self.reward_function = reward_function
         
         # Set the random seed for reproducibility
         seed_everything(seed)
@@ -112,7 +115,8 @@ class ParallelZeroTrainer:
             "board_height": rules.height,
             "board_width": rules.width,
             "num_workers": self.num_workers,
-            "seed": seed
+            "seed": seed,
+            "reward_function": "custom" if self.reward_function else "default_score"
         }
         
         self.monitor = ZeroMonitor(
@@ -162,14 +166,15 @@ class ParallelZeroTrainer:
         if actual_games != games_per_epoch:
             print(f"Note: Adjusted games from {games_per_epoch} to {actual_games} for even distribution")
         
-        # Create and run parallel self-play worker
+        # Create and run parallel self-play worker with custom reward function
         worker = MultiprocessSelfPlayWorker(
             model_path=self.model_path,
             num_workers=self.num_workers,
             games_per_worker=games_per_worker,
             simulations_per_move=simulations,
             temp_dir=self.temp_dir,
-            seed=self.seed
+            seed=self.seed,
+            reward_function=self.reward_function
         )
         
         # Generate games in parallel
@@ -198,13 +203,23 @@ class ParallelZeroTrainer:
         """
         self.model.train()
         
-        # Move model to best available device
+        # Move model to best available device with anti-deadlock protections
         device = self.device_manager.get_best_device()
         
         # Use timeout protection for CUDA devices
         if device.startswith('cuda'):
-            with cuda_operation_timeout(seconds=30):
-                self.model.to(device)
+            try:
+                # Simple initialization without complex operations
+                device_idx = int(device.split(':')[1]) if ':' in device else 0
+                torch.cuda.set_device(device_idx)
+                
+                # Don't call any complex CUDA operations before moving model
+                # Just move the model with timeout protection
+                with cuda_operation_timeout(seconds=30):
+                    self.model.to(device)
+            except Exception as e:
+                # If anything fails, fail immediately - no retries
+                raise RuntimeError(f"CUDA error during model transfer: {e}")
         else:
             self.model.to(device)
 
@@ -413,8 +428,12 @@ class ParallelZeroTrainer:
             max_score = epoch_stats.get('max_score', 0)
             avg_score = epoch_stats.get('total_score', 0) / max(1, epoch_stats.get('games', 1))
             loss_str = f"{loss:.4f}" if loss is not None else "N/A"
-            print(f"Epoch {epoch+1} summary: MaxTile={max_tile}, MaxScore={max_score}, " +
-                  f"AvgScore={avg_score:.1f}, Loss={loss_str}, Time={epoch_time:.1f}s")
+            reward_type = epoch_stats.get('reward_type', 'unknown')
+            
+            # Include reward type in the summary
+            print(f"Epoch {epoch+1} summary: MaxScore={max_score}, MaxTile={max_tile}, " +
+                 f"AvgScore={avg_score:.1f}, Loss={loss_str}, " +
+                 f"Reward={reward_type}, Time={epoch_time:.1f}s")
             
             # Prepare epoch data for run tracker
             epoch_data = {
@@ -429,7 +448,8 @@ class ParallelZeroTrainer:
                 "policy_loss": pi_loss if samples else None,
                 "value_loss": v_loss if samples else None,
                 "learning_rate": scheduler.get_last_lr()[0] if scheduler else None,
-                "epoch_time_seconds": epoch_time
+                "epoch_time_seconds": epoch_time,
+                "reward_type": epoch_stats.get('reward_type', 'unknown')
             }
             
             # Update run tracker

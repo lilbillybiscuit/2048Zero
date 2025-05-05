@@ -11,9 +11,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from game_alt import GameRules, GameState, BitBoard, GameRunner
-from zeromodel import ZeroNetwork
-from zeromonitoring import ZeroMonitor, EpochStats, print_epoch_summary
+from zero import *
 
 __all__ = [
     "ZeroMCTSNode",
@@ -234,9 +232,8 @@ class ZeroPlayer:
 
     def _evaluate_leaf(self, node: ZeroMCTSNode) -> float:
         if node.is_terminal:
-            # TODO: convert bitboard to numpy only if needed for max_tile calculation
-            np_board = BitBoard.to_numpy(node.bitboard, node.height, node.width)
-            max_tile = self.rules.get_max_tile(np_board)
+            # For terminal nodes, use the score as basis for reward
+            # This normalizes the score using log scale, similar to our default reward function
             return math.log2(node.score) if node.score > 0 else 0.0
 
         if node.bitboard in self._value_cache:
@@ -262,7 +259,8 @@ class ZeroTrainer:
                  player: Optional[ZeroPlayer] = None,
                  use_wandb: bool = True,
                  project_name: str = "2048-zero",
-                 experiment_name: Optional[str] = None):
+                 experiment_name: Optional[str] = None,
+                 reward_function = None):
         """Initialize the Zero trainer with model, rules and wandb tracking
         
         Args:
@@ -272,10 +270,13 @@ class ZeroTrainer:
             use_wandb: Whether to use wandb for tracking (default: True)
             project_name: Project name for wandb
             experiment_name: Experiment name for wandb (auto-generated if None)
+            reward_function: Custom function to calculate reward value with signature:
+                           reward_function(state, game_stats) -> (reward_value, reward_name)
         """
         self.model = model
         self.rules = rules
         self.player = ZeroPlayer(model, rules) if player is None else player
+        self.reward_function = reward_function
         
         # Generate experiment name if none provided
         if experiment_name is None:
@@ -293,6 +294,7 @@ class ZeroTrainer:
             "board_width": rules.width,
             "dirichlet_eps": self.player.dir_eps,
             "dirichlet_alpha": self.player.dir_alpha,
+            "reward_function": "custom" if self.reward_function else "default_score"
         }
         
         self.monitor = ZeroMonitor(
@@ -354,7 +356,37 @@ class ZeroTrainer:
                 state = GameState(new_board, state.score + gain, new_bitboard)
 
             max_tile = self.rules.get_max_tile(state.board)
-            z = math.log2(int(max_tile) + 1) / 11.0 * 2 - 1  # scaled into [-1,1]
+            
+            # Calculate game statistics for reward function
+            game_stats = {
+                'score': state.score,
+                'max_tile': max_tile,
+                'turns': turn_count,
+                'action_counts': action_counts,
+                'final_board': state.board
+            }
+            
+            # Define default reward functions if none provided
+            def default_score_reward(state, stats):
+                """Default score-based reward"""
+                score = stats['score']
+                # Normalize score to [-1, 1] range using log scale
+                z = min(max((math.log(score + 100) / math.log(50000 + 100)) * 2 - 1, -1.0), 1.0)
+                return z, "score"
+            
+            # Use provided reward function or default to score reward
+            if self.reward_function:
+                z, reward_type = self.reward_function(state, game_stats)
+            else:
+                # Default to score reward (not max tile)
+                z, reward_type = default_score_reward(state, game_stats)
+                
+            # Store reward info in statistics
+            game_stats['reward'] = z
+            game_stats['reward_type'] = reward_type
+            
+            # Record the reward type in the epoch stats for logging
+            stats.update_reward_type(reward_type)
 
             stats.update_game_stats(
                 score=state.score,
@@ -613,7 +645,8 @@ class ZeroTrainer:
                 "policy_loss": pi_loss if samples else None,
                 "value_loss": v_loss if samples else None,
                 "learning_rate": scheduler.get_last_lr()[0],
-                "epoch_time_seconds": epoch_time
+                "epoch_time_seconds": epoch_time,
+                "reward_type": epoch_stats.get('reward_type', 'default_score')
             }
             
             # Update run tracker

@@ -5,10 +5,8 @@
 import os
 import torch
 import time
-from datetime import datetime
-from zeromodel import ZeroNetwork
-from zero2048 import ZeroPlayer, ZeroTrainer
-from game_alt import GameRules, BitBoard, GameState
+from zero import ZeroNetwork, ZeroTrainer, GameRules
+
 
 def main():
     # Training parameters
@@ -43,13 +41,24 @@ def main():
         model.load(checkpoint_path)
         print(f"Loaded model from {checkpoint_path}")
     
+    # Define a score-based reward function
+    def score_reward(state, stats):
+        """Reward based on score - normalize to [-1, 1] using log scale"""
+        import math
+        score = stats['score']
+        # Normalize score to [-1, 1] range using log scale
+        z = min(max((math.log(score + 100) / math.log(50000 + 100)) * 2 - 1, -1.0), 1.0)
+        return z, "score"
+    
     # Create trainer with wandb enabled by default
+    # Pass the score_reward function (score is now the default if no function is provided)
     trainer = ZeroTrainer(
         model=model, 
         rules=rules,
         use_wandb=True,  # Always enable wandb
         project_name=project_name,
-        experiment_name=experiment_name
+        experiment_name=experiment_name,
+        reward_function=score_reward  # Using score reward
     )
     
     # Run training

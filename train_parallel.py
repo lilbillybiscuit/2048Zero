@@ -9,9 +9,10 @@ import torch
 
 # Original implementation is now thread-safe
 
-from game_alt import GameRules
-from zeromodel import ZeroNetwork
+from zero.game import GameRules
+from zero.zeromodel import ZeroNetwork
 from distributed import ParallelZeroTrainer, DeviceManager
+from zero.reward_functions import score_reward_func, hybrid_reward_func
 
 def main():
     # Parse command line arguments
@@ -27,6 +28,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--simulations", type=int, default=50, help="MCTS simulations per move")
+    parser.add_argument("--accelerator", type=str, choices=["cuda", "mps", "cpu"], 
+                        help="Force a specific accelerator ('cuda', 'mps', or 'cpu')")
     
     # Parallel settings
     parser.add_argument("--workers", type=int, default=None, 
@@ -49,8 +52,27 @@ def main():
     
     # Initialize device manager
     device_manager = DeviceManager()
-    best_device = device_manager.get_best_device()
-    print(f"Using device: {best_device}")
+    
+    # Handle forced accelerator if specified
+    if args.accelerator:
+        if args.accelerator == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA accelerator requested but not available on this system")
+        elif args.accelerator == "mps" and not torch.backends.mps.is_available():
+            raise RuntimeError("MPS accelerator requested but not available on this system")
+            
+        best_device = args.accelerator
+        print(f"Using forced accelerator: {best_device}")
+        
+        # Set appropriate environment variable
+        if args.accelerator == "cuda":
+            os.environ["FORCE_CUDA"] = "1"
+        elif args.accelerator == "mps":
+            os.environ["FORCE_MPS"] = "1"
+        elif args.accelerator == "cpu":
+            os.environ["FORCE_CPU"] = "1"
+    else:
+        best_device = device_manager.get_best_device()
+        print(f"Using auto-selected device: {best_device}")
     
     # Initialize model
     if args.checkpoint and os.path.exists(args.checkpoint):
@@ -64,6 +86,8 @@ def main():
     # Move model to best device
     model = model.to(best_device)
     
+    # We use unified module-level functions for reward calculation
+    
     # Create trainer with specified number of workers
     trainer = ParallelZeroTrainer(
         model=model,
@@ -72,7 +96,8 @@ def main():
         project_name=args.project_name,
         experiment_name=args.experiment_name,
         num_workers=args.workers,
-        seed=args.seed
+        seed=args.seed,
+        reward_function=hybrid_reward_func
     )
     
     # Run training

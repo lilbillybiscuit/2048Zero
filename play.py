@@ -4,11 +4,8 @@
 """
 import os
 import torch
-import time
 import argparse
-from zeromodel import ZeroNetwork
-from zero2048 import ZeroPlayer
-from game_alt import GameRules, BitBoard, GameState, GameRunner
+from zero import *
 
 def main():
     parser = argparse.ArgumentParser(description="2048 Zero - Play with a trained model")

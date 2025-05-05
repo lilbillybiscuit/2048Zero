@@ -1,7 +1,5 @@
 import numpy as np
-import random
-from typing import Dict, List, Tuple, Optional, Any
-from game_alt import Simplified2048
+from zero import Simplified2048
 
 
 class Simplified2048Adapter:

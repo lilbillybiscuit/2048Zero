@@ -4,18 +4,14 @@ Parallel self-play implementation for distributed AlphaZero 2048
 
 import os
 import time
-import math
 import pickle
 import multiprocessing
-from typing import List, Dict, Tuple, Any, Optional
+from typing import List, Dict, Tuple, Any
 
-import numpy as np
 import torch
 
-from game_alt import GameRules, GameState, BitBoard
-from zero2048 import ZeroPlayer
-from zeromodel import ZeroNetwork
-from zeromonitoring import EpochStats
+from zero import GameRules, GameState, BitBoard, ZeroPlayer, ZeroNetwork
+from zero.zeromonitoring import EpochStats
 from .gpu_utils import DeviceManager, seed_everything
 
 # Set default multiprocessing start method for PyTorch compatibility
@@ -31,7 +27,8 @@ def play_single_game(
     player: ZeroPlayer, 
     rules: GameRules, 
     simulations: int = 50,
-    game_id: str = None
+    game_id: str = None,
+    reward_function = None  # Custom reward function
 ) -> Tuple[List[Any], Dict[str, Any]]:
     """
     Play a single self-play game and return samples and statistics
@@ -41,11 +38,18 @@ def play_single_game(
         rules: GameRules instance
         simulations: Number of MCTS simulations per move
         game_id: Optional game identifier for debugging
+        reward_function: Custom function to calculate reward, with signature:
+                        reward_function(state, game_stats) -> (reward_value, reward_name)
+                        If None, defaults to max_score reward
         
     Returns:
         Tuple of (samples, game_stats)
     """
-    import math
+
+    # Use provided reward function or default to score reward from zero module
+    from zero.reward_functions import default_reward_func as module_default_reward
+    if reward_function is None:
+        reward_function = module_default_reward
     
     samples = []
     state = rules.get_initial_state()
@@ -73,13 +77,6 @@ def play_single_game(
     # Calculate final game statistics
     max_tile = rules.get_max_tile(state.board)
     
-    # Scale the final value between -1 and 1
-    z = math.log2(int(max_tile) + 1) / 11.0 * 2 - 1
-    
-    # Create samples from trajectory with the final value
-    for (board_t, pi_t) in trajectory:
-        samples.append((board_t, pi_t, z))
-    
     # Create game statistics
     game_stats = {
         'score': state.score,
@@ -89,6 +86,17 @@ def play_single_game(
         'final_board': state.board,
         'game_id': game_id
     }
+    
+    # Calculate reward using the provided function
+    z, reward_type = reward_function(state, game_stats)
+    
+    # Create samples from trajectory with the calculated reward value
+    for (board_t, pi_t) in trajectory:
+        samples.append((board_t, pi_t, z))
+    
+    # Add the reward value to game stats for logging
+    game_stats['reward'] = z
+    game_stats['reward_type'] = reward_type
     
     return samples, game_stats
 
@@ -103,7 +111,8 @@ class MultiprocessSelfPlayWorker:
         games_per_worker: int = 10,
         simulations_per_move: int = 50,
         temp_dir: str = "temp_data",
-        seed: int = 42
+        seed: int = 42,
+        reward_function = None  # Custom reward function
     ):
         """
         Initialize the self-play worker
@@ -115,6 +124,7 @@ class MultiprocessSelfPlayWorker:
             simulations_per_move: MCTS simulations per move
             temp_dir: Directory for temporary data storage
             seed: Random seed for initialization
+            reward_function: Custom function to calculate reward value
         """
         self.model_path = model_path
         self.num_workers = num_workers if num_workers is not None else multiprocessing.cpu_count()
@@ -122,6 +132,7 @@ class MultiprocessSelfPlayWorker:
         self.simulations_per_move = simulations_per_move
         self.temp_dir = temp_dir
         self.seed = seed
+        self.reward_function = reward_function
         
         # Create temp directory if it doesn't exist
         os.makedirs(self.temp_dir, exist_ok=True)
@@ -154,14 +165,28 @@ class MultiprocessSelfPlayWorker:
                 f"{self.temp_dir}/worker_{worker_id}_samples.pkl",
                 f"{self.temp_dir}/worker_{worker_id}_stats.pkl",
                 device,
-                worker_seed
+                worker_seed,
+                self.reward_function  # Pass the reward_function to worker
             ))
         
-        # Launch worker processes
+        # Launch worker processes with protection against potential deadlocks
         start_time = time.time()
         ctx = multiprocessing.get_context('spawn')
+        
+        # Use timeout to prevent deadlocks
+        results = []
         with ctx.Pool(self.num_workers) as pool:
-            pool.starmap(self._worker_process, worker_args)
+            # Use apply_async instead of starmap to better handle hanging processes
+            tasks = [pool.apply_async(self._worker_process, args) for args in worker_args]
+            
+            # Wait for all tasks with timeout to prevent deadlocks
+            for task in tasks:
+                # Set a generous timeout for each task
+                task.wait(timeout=600)  # 10 minutes timeout per worker
+                
+            # Close the pool and join without waiting forever
+            pool.close()
+            pool.join()
         
         # Collect samples and statistics from all workers
         all_samples = []
@@ -217,7 +242,8 @@ class MultiprocessSelfPlayWorker:
         samples_path: str,
         stats_path: str,
         device: str,
-        seed: int
+        seed: int,
+        reward_function=None
     ):
         """
         Worker process function that generates self-play games
@@ -231,6 +257,7 @@ class MultiprocessSelfPlayWorker:
             stats_path: Path to save statistics
             device: Device to use for model inference
             seed: Random seed for reproducibility
+            reward_function: Custom function to calculate reward value
         """
         try:
             # Set random seed for this worker
@@ -245,17 +272,29 @@ class MultiprocessSelfPlayWorker:
             model = ZeroNetwork(rules.height, rules.width, 16)  # 16 for max tile exponent
             model.load_state_dict(torch.load(model_path, map_location='cpu'))
             
-            # Initialize CUDA if needed
+            # Initialize CUDA if needed - use anti-deadlock pattern with staggered initialization
             if device.startswith('cuda'):
                 device_idx = int(device.split(':')[1]) if ':' in device else 0
-                from .cuda_utils import setup_cuda_for_worker, cuda_operation_timeout
+                from .cuda_utils import cuda_operation_timeout
                 
-                # Fail if initialization fails
-                setup_cuda_for_worker(device_idx)
+                # Set critical environment variables (thread-local)
+                os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+                os.environ['OMP_NUM_THREADS'] = '1'  # Minimal thread usage
                 
-                # Move model to device with timeout protection
-                with cuda_operation_timeout(seconds=30):
-                    model = model.to(device)
+                # Sleep a tiny bit based on worker_id to avoid all processes initializing simultaneously
+                # This helps prevent CUDA context initialization contention
+                time.sleep(0.5 * (worker_id % torch.cuda.device_count()))
+                
+                # Just set the device - minimal initialization
+                torch.cuda.set_device(device_idx)
+                
+                # Move model with timeout
+                try:
+                    with cuda_operation_timeout(seconds=30):
+                        model = model.to(device)
+                except Exception as e:
+                    # If anything fails, don't retry - just raise the error
+                    raise RuntimeError(f"CUDA error on device {device_idx}: {e}")
             else:
                 model = model.to(device)
                 
@@ -279,7 +318,8 @@ class MultiprocessSelfPlayWorker:
                         player=player,
                         rules=rules,
                         simulations=simulations,
-                        game_id=f"w{worker_id}_g{game_idx}"
+                        game_id=f"w{worker_id}_g{game_idx}",
+                        reward_function=reward_function  # Use the passed down reward_function
                     )
                     
                     # Add samples from this game
@@ -294,11 +334,19 @@ class MultiprocessSelfPlayWorker:
                         board=game_stats['final_board']
                     )
                     
-                    # Print when a game is completed with score and max tile
-                    print(f"W{worker_id} Game {game_idx+1}/{num_games} - Score: {game_stats['score']}, Max Tile: {game_stats['max_tile']}")
+                    # Print when a game is completed with score, max tile, and reward value
+                    print(f"W{worker_id} Game {game_idx+1}/{num_games} - Score: {game_stats['score']}, " +
+                          f"Max Tile: {game_stats['max_tile']}, Reward: {game_stats['reward']:.3f} ({game_stats['reward_type']})")
+                    
+                    # Update reward type in the statistics object for proper tracking
+                    stats.update_reward_type(game_stats['reward_type'])
                     
                 except Exception as game_error:
                     print(f"Worker {worker_id}, Game {game_idx} failed: {game_error}")
+                    import traceback
+                    traceback.print_exc()
+                    # Fail the entire worker process if a game crashes, which will propagate to the main process
+                    raise RuntimeError(f"Game {game_idx} failed in worker {worker_id}. Training will be terminated.")
             
             # Save samples and statistics
             with open(samples_path, 'wb') as f:
@@ -312,11 +360,8 @@ class MultiprocessSelfPlayWorker:
             import traceback
             traceback.print_exc()
             
-            # Save empty results to avoid hanging
-            with open(samples_path, 'wb') as f:
-                pickle.dump([], f)
-            with open(stats_path, 'wb') as f:
-                pickle.dump({}, f)
+            # Re-raise the exception to terminate the whole training process
+            raise
     
     @staticmethod
     def _initialize_combined_stats() -> Dict[str, Any]:

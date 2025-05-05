@@ -1,7 +1,4 @@
-from game_alt import GameRules
-from zero2048 import *
-from zero2048 import ZeroTrainer
-from zeromodel import ZeroNetwork
+from zero import *
 
 def main():
     spawn_rates = {
