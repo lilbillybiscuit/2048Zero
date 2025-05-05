@@ -99,8 +99,8 @@ class ZeroMCTSNode:
 
     @property
     def is_terminal(self) -> bool:
-        # Use fast bitboard operation to check if terminal
-        return not BitBoard.fast_has_valid_moves(self.bitboard, self.height, self.width)
+        # Use thread-safe bitboard operation to check if terminal
+        return not BitBoard.has_valid_moves(self.bitboard, self.height, self.width)
 
     @property
     def q_value(self) -> float:

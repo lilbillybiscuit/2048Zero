@@ -38,6 +38,7 @@ class BitBoard:
     @staticmethod
     @numba.njit
     def fast_has_valid_moves(bitboard: int, height: int, width: int) -> bool:
+        """Original Numba-accelerated implementation - can cause overflow errors with large bitboards"""
         # Check for empty cells
         for i in range(height * width):
             shift = i * 4
@@ -70,6 +71,38 @@ class BitBoard:
                     return True
 
         return False
+        
+    @staticmethod
+    def has_valid_moves(bitboard: int, height: int, width: int) -> bool:
+        """
+        Thread-safe implementation that handles large integers correctly.
+        Used as a fallback when fast_has_valid_moves fails with overflow.
+        """
+        try:
+            # Try the fast Numba version first
+            return BitBoard.fast_has_valid_moves(bitboard, height, width)
+        except (OverflowError, ValueError):
+            # If that fails, use the pure Python version
+            # Convert bitboard to numpy array
+            board = BitBoard.to_numpy(bitboard, height, width)
+            
+            # Check for empty cells
+            if np.any(board == 0):
+                return True
+                
+            # Check for mergeable horizontal cells
+            for r in range(height):
+                for c in range(width - 1):
+                    if board[r, c] != 0 and board[r, c] == board[r, c + 1]:
+                        return True
+            
+            # Check for mergeable vertical cells
+            for c in range(width):
+                for r in range(height - 1):
+                    if board[r, c] != 0 and board[r, c] == board[r + 1, c]:
+                        return True
+            
+            return False
 
 class GameState(NamedTuple):
     board: BoardType  # NumPy representation of the board
@@ -269,7 +302,7 @@ class GameRules:
     def get_valid_moves(self, board: BoardType) -> List[int]:
         # First check with BitBoard if any moves are available at all
         bitboard = BitBoard.from_numpy(board)
-        if not BitBoard.fast_has_valid_moves(bitboard, self.height, self.width):
+        if not BitBoard.has_valid_moves(bitboard, self.height, self.width):
             return []
             
         # If moves are available, determine which specific directions are valid
@@ -284,7 +317,7 @@ class GameRules:
     def is_terminal(self, board: BoardType) -> bool:
         # Use the BitBoard for faster terminal state checking
         bitboard = BitBoard.from_numpy(board)
-        return not BitBoard.fast_has_valid_moves(bitboard, self.height, self.width)
+        return not BitBoard.has_valid_moves(bitboard, self.height, self.width)
 
     def add_random_tiles(self, board: BoardType, return_action=False) -> Union[Tuple[BoardType, List[Tuple[int]]], BoardType]:
         """
