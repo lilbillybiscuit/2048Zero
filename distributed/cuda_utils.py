@@ -99,18 +99,28 @@ def get_cuda_memory_usage(device_idx: Optional[int] = None) -> Dict[str, float]:
         print(f"Error getting CUDA memory: {e}")
         return {"allocated_mb": 0, "reserved_mb": 0, "free_mb": 0, "total_mb": 0}
 
-def safe_cuda_initialization(device_idx: Optional[int] = None) -> bool:
+def safe_cuda_initialization(device_idx: Optional[int] = None, allow_cpu_fallback: bool = False) -> bool:
     """
     Initialize CUDA in a safe manner for multiprocessing
     
     Args:
         device_idx: Specific CUDA device to initialize, or None for all devices
+        allow_cpu_fallback: If True, allows silent fallback to CPU. If False, raises exceptions
         
     Returns:
         bool: True if initialization was successful
+        
+    Raises:
+        RuntimeError: If CUDA initialization fails and allow_cpu_fallback is False
     """
+    # Verify CUDA is available
     if not torch.cuda.is_available():
-        return False
+        error_msg = "CUDA requested but not available on this system"
+        if allow_cpu_fallback:
+            print(f"Error: {error_msg}. Falling back to CPU.")
+            return False
+        else:
+            raise RuntimeError(error_msg)
         
     try:
         with cuda_operation_timeout(CUDA_INIT_TIMEOUT):
@@ -125,16 +135,21 @@ def safe_cuda_initialization(device_idx: Optional[int] = None) -> bool:
             if device_idx is not None:
                 # Initialize single device
                 if device_idx >= torch.cuda.device_count():
-                    print(f"Error: Device {device_idx} not available")
-                    return False
+                    error_msg = f"CUDA device {device_idx} not available. System has {torch.cuda.device_count()} GPU(s)"
+                    if allow_cpu_fallback:
+                        print(f"Error: {error_msg}. Falling back to CPU.")
+                        return False
+                    else:
+                        raise RuntimeError(error_msg)
                     
                 # Set device and initialize context
                 torch.cuda.set_device(device_idx)
                 device = f'cuda:{device_idx}'
                 
                 # Initialize CUDA context with a small tensor
-                # Immediately delete to free memory
-                dummy = torch.zeros(TENSOR_INIT_SIZE, device=device)
+                # Use a scalar tensor (size 1) to avoid conversion errors
+                dummy = torch.zeros(1, device=device)
+                value = dummy.item()  # Force synchronization
                 del dummy
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize(device)
@@ -147,7 +162,10 @@ def safe_cuda_initialization(device_idx: Optional[int] = None) -> bool:
                     # Set device and create tensor to initialize context
                     torch.cuda.set_device(i)
                     device = f'cuda:{i}'
-                    dummy = torch.zeros(TENSOR_INIT_SIZE, device=device)
+                    
+                    # Use a scalar tensor (size 1) to avoid conversion errors
+                    dummy = torch.zeros(1, device=device)
+                    value = dummy.item()  # Force synchronization
                     del dummy
                     torch.cuda.empty_cache()
                     
@@ -160,45 +178,72 @@ def safe_cuda_initialization(device_idx: Optional[int] = None) -> bool:
                 
             return True
     except TimeoutException:
-        print(f"CUDA initialization timed out after {CUDA_INIT_TIMEOUT} seconds.")
-        return False
+        error_msg = f"CUDA initialization timed out after {CUDA_INIT_TIMEOUT} seconds"
+        if allow_cpu_fallback:
+            print(f"Error: {error_msg}. Falling back to CPU.")
+            return False
+        else:
+            print(f"Error: {error_msg}")
+            raise RuntimeError(error_msg)
     except Exception as e:
-        print(f"CUDA initialization error: {e}")
-        return False
+        error_msg = f"CUDA initialization error: {e}"
+        if allow_cpu_fallback:
+            print(f"Error: {error_msg}. Falling back to CPU.")
+            return False
+        else:
+            print(f"Error: {error_msg}")
+            raise RuntimeError(error_msg)
 
-def setup_cuda_for_worker(device_idx: int) -> bool:
+def setup_cuda_for_worker(device_idx: int, allow_cpu_fallback: bool = False) -> bool:
     """
     Configure the CUDA environment for a worker process.
     Should be called at the start of each worker process.
     
     Args:
         device_idx: The CUDA device index for this worker
+        allow_cpu_fallback: If True, allows silent fallback to CPU. If False, raises exceptions
         
     Returns:
         bool: True if successful, False if fell back to CPU
+        
+    Raises:
+        RuntimeError: If CUDA initialization fails and allow_cpu_fallback is False
     """
-    try:
-        # Verify device exists
-        if device_idx >= torch.cuda.device_count():
-            print(f"Warning: CUDA device {device_idx} not available, falling back to CPU")
+    # Verify CUDA is available
+    if not torch.cuda.is_available():
+        error_msg = "CUDA requested but not available on this system"
+        if allow_cpu_fallback:
+            print(f"Error: {error_msg}. Falling back to CPU.")
             return False
+        else:
+            raise RuntimeError(error_msg)
             
-        # Set thread limits to avoid resource contention
-        os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS_PER_GPU)
-        torch.set_num_threads(MAX_THREADS_PER_GPU)
-        
-        # Disable P2P access which can sometimes cause issues
-        os.environ["NCCL_P2P_DISABLE"] = "1"
-        
+    # Verify device index is valid
+    if device_idx >= torch.cuda.device_count():
+        error_msg = f"CUDA device {device_idx} not available. System has {torch.cuda.device_count()} GPU(s)"
+        if allow_cpu_fallback:
+            print(f"Error: {error_msg}. Falling back to CPU.")
+            return False
+        else:
+            raise RuntimeError(error_msg)
+            
+    # Set thread limits to avoid resource contention
+    os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS_PER_GPU)
+    torch.set_num_threads(MAX_THREADS_PER_GPU)
+    
+    # Disable P2P access which can sometimes cause issues
+    os.environ["NCCL_P2P_DISABLE"] = "1"
+    
+    try:
         # Set device before any CUDA operations
         torch.cuda.set_device(device_idx)
         
         # Initialize context with timeout protection
         with cuda_operation_timeout(CUDA_INIT_TIMEOUT):
-            # Create and immediately free a small tensor to initialize context
+            # Create a small tensor to initialize context
             # This is critical to prevent deadlocks on Linux multi-GPU systems
-            dummy = torch.zeros(TENSOR_INIT_SIZE, device=f"cuda:{device_idx}")
-            value = dummy.item()  # Force synchronization
+            dummy = torch.zeros(1, device=f"cuda:{device_idx}")  # Use a scalar tensor (size 1)
+            value = dummy.item()  # Force synchronization (works with scalar)
             del dummy
             torch.cuda.empty_cache()
             torch.cuda.synchronize(device_idx)
@@ -207,9 +252,13 @@ def setup_cuda_for_worker(device_idx: int) -> bool:
         return True
         
     except (TimeoutException, Exception) as e:
-        print(f"CUDA setup error for device {device_idx}: {e}")
-        print("Falling back to CPU")
-        return False
+        error_msg = f"CUDA setup error for device {device_idx}: {e}"
+        if allow_cpu_fallback:
+            print(f"Error: {error_msg}. Falling back to CPU.")
+            return False
+        else:
+            print(f"Error: {error_msg}")
+            raise RuntimeError(error_msg)
 
 def with_cuda_retry(max_retries: int = 3, retry_delay: float = 1.0) -> Callable:
     """

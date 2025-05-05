@@ -53,7 +53,8 @@ class ParallelZeroTrainer:
         seed_everything(seed)
         
         # Set up device manager first to get GPU count
-        self.device_manager = DeviceManager()
+        # Don't allow silent fallback to CPU - if CUDA is requested but not available, raise an error
+        self.device_manager = DeviceManager(allow_cpu_fallback=False)
         
         # Set number of workers
         if num_workers is not None:
@@ -208,11 +209,11 @@ class ParallelZeroTrainer:
                 self.model.to(device)
                 
             print(f"Training on device: {device}")
-        except TimeoutException:
-            print(f"WARNING: Model transfer to {device} timed out, falling back to CPU")
-            device = 'cpu'
-            self.model.to(device)
-            print(f"Training on device: {device} (fallback)")
+        except TimeoutException as e:
+            # Don't fall back to CPU - raise an exception if CUDA timeout occurs
+            error_msg = f"Model transfer to {device} timed out: {e}"
+            print(f"ERROR: {error_msg}")
+            raise RuntimeError(error_msg)
             
         # Log GPU memory usage if using CUDA
         if device.startswith('cuda'):

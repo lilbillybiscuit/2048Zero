@@ -126,8 +126,8 @@ class MultiprocessSelfPlayWorker:
         # Create temp directory if it doesn't exist
         os.makedirs(self.temp_dir, exist_ok=True)
         
-        # Initialize device manager
-        self.device_manager = DeviceManager()
+        # Initialize device manager with no fallback to CPU
+        self.device_manager = DeviceManager(allow_cpu_fallback=False)
         
     def generate_games(self) -> Tuple[List[Any], Dict[str, Any]]:
         """
@@ -257,14 +257,18 @@ class MultiprocessSelfPlayWorker:
                 device_idx = int(device.split(':')[1]) if ':' in device else 0
                 
                 # Use our improved setup_cuda_for_worker function
-                from .cuda_utils import setup_cuda_for_worker, cuda_operation_timeout
+                from .cuda_utils import setup_cuda_for_worker, cuda_operation_timeout, TimeoutException
                 
-                if not setup_cuda_for_worker(device_idx):
-                    print(f"Warning: Worker {worker_id} - Could not initialize CUDA device {device_idx}, falling back to CPU")
-                    device = 'cpu'
-                else:
-                    # Keep the device as CUDA
+                try:
+                    # Don't allow fallback - raise exception if CUDA initialization fails
+                    setup_cuda_for_worker(device_idx, allow_cpu_fallback=False)
                     print(f"Worker {worker_id} - CUDA context successfully initialized on device {device}")
+                except Exception as e:
+                    # If we get here, there was a CUDA error and we need to stop the worker
+                    error_msg = f"Worker {worker_id} - CUDA initialization failed: {e}"
+                    print(f"ERROR: {error_msg}")
+                    # Re-raise to stop the worker
+                    raise RuntimeError(error_msg)
             
             # Now move model to device with timeout protection
             try:
@@ -276,11 +280,11 @@ class MultiprocessSelfPlayWorker:
                     model = model.to(device)
                 
                 model.eval()  # Set to evaluation mode
-            except TimeoutException:
-                print(f"Worker {worker_id} - Model transfer to {device} timed out, falling back to CPU")
-                device = 'cpu'
-                model = model.to(device)
-                model.eval()
+            except TimeoutException as e:
+                # Don't fall back to CPU - raise an exception if CUDA timeout occurs
+                error_msg = f"Worker {worker_id} - Model transfer to {device} timed out: {e}"
+                print(f"ERROR: {error_msg}")
+                raise RuntimeError(error_msg)
             
             print(f"Worker {worker_id} initialized model on device: {device}")
             

@@ -22,10 +22,12 @@ from .cuda_utils import safe_cuda_initialization, setup_cuda_for_worker
 from .parallel_selfplay import MultiprocessSelfPlayWorker
 from .parallel_trainer import ParallelZeroTrainer
 
-# Initialize CUDA safely if available
+# Initialize CUDA (will raise an error if it fails - no silent fallbacks)
 if torch.cuda.is_available():
     print(f"Initializing CUDA - {torch.cuda.device_count()} GPU(s) detected")
-    safe_cuda_initialization()
+    
+    # Use False for allow_cpu_fallback to force errors to be raised
+    safe_cuda_initialization(allow_cpu_fallback=False)
     
     # Print GPU details
     for i in range(torch.cuda.device_count()):
