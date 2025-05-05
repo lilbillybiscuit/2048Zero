@@ -17,6 +17,7 @@ from zeromodel import ZeroNetwork
 from zeromonitoring import ZeroMonitor, EpochStats, print_epoch_summary
 from .parallel_selfplay import MultiprocessSelfPlayWorker
 from .gpu_utils import DeviceManager, seed_everything
+from .cuda_utils import cuda_operation_timeout, TimeoutException, safe_cuda_initialization
 
 
 class ParallelZeroTrainer:
@@ -197,10 +198,29 @@ class ParallelZeroTrainer:
         """
         self.model.train()
         
-        # Move model to best available device for training
+        # Move model to best available device for training with timeout protection
         device = self.device_manager.get_best_device()
-        self.model.to(device)
-        print(f"Training on device: {device}")
+        try:
+            if device.startswith('cuda'):
+                with cuda_operation_timeout(seconds=30):
+                    self.model.to(device)
+            else:
+                self.model.to(device)
+                
+            print(f"Training on device: {device}")
+        except TimeoutException:
+            print(f"WARNING: Model transfer to {device} timed out, falling back to CPU")
+            device = 'cpu'
+            self.model.to(device)
+            print(f"Training on device: {device} (fallback)")
+            
+        # Log GPU memory usage if using CUDA
+        if device.startswith('cuda'):
+            from .cuda_utils import get_cuda_memory_usage
+            device_idx = int(device.split(':')[1]) if ':' in device else 0
+            memory_stats = get_cuda_memory_usage(device_idx)
+            print(f"GPU memory: {memory_stats['allocated_mb']:.1f}MB allocated, "
+                  f"{memory_stats['reserved_mb']:.1f}MB reserved")
 
         random.shuffle(samples)
 

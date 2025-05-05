@@ -674,7 +674,7 @@ if __name__ == "__main__":
         
         # Get action from agent with short time limit for the demo
         print(f"\nThinking about move {turn}...")
-        action, (probs, value) = agent.play(state, time_limit=0.2)
+        action, (probs, value) = agent.play(state, simulations=100)
         action_name = rules.get_direction_name(action)
         
         # Execute the action

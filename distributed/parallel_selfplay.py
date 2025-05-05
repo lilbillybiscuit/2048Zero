@@ -253,23 +253,34 @@ class MultiprocessSelfPlayWorker:
             
             # If using CUDA, handle possible CUDA initialization issues
             if device.startswith('cuda'):
-                try:
-                    # Try to ensure CUDA is initialized before model transfer
-                    if not torch.cuda.is_initialized():
-                        torch.cuda.init()
-                    
-                    # Get device index and check if it's valid
-                    device_idx = int(device.split(':')[1]) if ':' in device else 0
-                    if device_idx >= torch.cuda.device_count():
-                        print(f"Warning: Worker {worker_id} - CUDA device {device_idx} not available, falling back to CPU")
-                        device = 'cpu'
-                except Exception as e:
-                    print(f"CUDA error in worker {worker_id}: {e}. Falling back to CPU.")
+                # Extract device index
+                device_idx = int(device.split(':')[1]) if ':' in device else 0
+                
+                # Use our improved setup_cuda_for_worker function
+                from .cuda_utils import setup_cuda_for_worker, cuda_operation_timeout
+                
+                if not setup_cuda_for_worker(device_idx):
+                    print(f"Warning: Worker {worker_id} - Could not initialize CUDA device {device_idx}, falling back to CPU")
                     device = 'cpu'
+                else:
+                    # Keep the device as CUDA
+                    print(f"Worker {worker_id} - CUDA context successfully initialized on device {device}")
             
-            # Now move model to device
-            model = model.to(device)
-            model.eval()  # Set to evaluation mode
+            # Now move model to device with timeout protection
+            try:
+                # This operation can sometimes hang, so we use a timeout
+                if device.startswith('cuda'):
+                    with cuda_operation_timeout(seconds=30):
+                        model = model.to(device)
+                else:
+                    model = model.to(device)
+                
+                model.eval()  # Set to evaluation mode
+            except TimeoutException:
+                print(f"Worker {worker_id} - Model transfer to {device} timed out, falling back to CPU")
+                device = 'cpu'
+                model = model.to(device)
+                model.eval()
             
             print(f"Worker {worker_id} initialized model on device: {device}")
             
