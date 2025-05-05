@@ -61,12 +61,26 @@ class DeviceManager:
         Returns:
             Device string ('cpu', 'cuda:0', 'mps', etc.)
         """
+        # If no GPUs or only CPU is available, return CPU
         if not self.devices or (len(self.devices) == 1 and self.devices[0] == 'cpu'):
             return 'cpu'
         
-        # Distribute workers evenly across available devices
-        device_idx = worker_id % len(self.devices)
-        return self.devices[device_idx]
+        # Special handling for CUDA with multiprocessing
+        if self.num_gpus > 0:
+            # Option 1: CPU-only self-play - Uncomment this line if having CUDA issues
+            # return 'cpu'
+            
+            # Option 2: Distribute multiple workers evenly across available GPUs
+            # This assigns multiple workers to the same GPU
+            gpu_index = worker_id % self.num_gpus
+            return f'cuda:{gpu_index}'
+        
+        # For MPS (Apple Silicon), all can share the same device
+        elif self.has_mps:
+            return 'mps'
+        
+        # Fallback to CPU
+        return 'cpu'
     
     def get_best_device(self) -> str:
         """

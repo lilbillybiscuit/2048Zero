@@ -29,7 +29,8 @@ def main():
     parser.add_argument("--simulations", type=int, default=50, help="MCTS simulations per move")
     
     # Parallel settings
-    parser.add_argument("--workers", type=int, default=None, help="Number of worker processes (default: CPU count)")
+    parser.add_argument("--workers", type=int, default=None, 
+                      help="Number of worker processes (default: auto-calculated based on CPU/GPU count)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
     # Checkpointing
@@ -63,7 +64,7 @@ def main():
     # Move model to best device
     model = model.to(best_device)
     
-    # Create trainer
+    # Create trainer with specified number of workers
     trainer = ParallelZeroTrainer(
         model=model,
         rules=rules,

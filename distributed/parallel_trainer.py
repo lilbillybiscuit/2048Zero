@@ -51,9 +51,50 @@ class ParallelZeroTrainer:
         # Set the random seed for reproducibility
         seed_everything(seed)
         
-        # Set number of workers (default to CPU count)
+        # Set up device manager first to get GPU count
         self.device_manager = DeviceManager()
-        self.num_workers = num_workers if num_workers is not None else os.cpu_count()
+        
+        # Set number of workers
+        if num_workers is not None:
+            # User specified a worker count
+            original_workers = num_workers
+            
+            # If GPUs are available, automatically round to ensure even distribution
+            if self.device_manager.num_gpus > 0:
+                # Calculate workers per GPU and round down to ensure even distribution
+                workers_per_gpu = num_workers // self.device_manager.num_gpus
+                # If workers_per_gpu is at least 1, adjust total count
+                if workers_per_gpu >= 1:
+                    self.num_workers = workers_per_gpu * self.device_manager.num_gpus
+                else:
+                    # If fewer workers than GPUs, use at least one worker per GPU
+                    self.num_workers = self.device_manager.num_gpus
+                
+                # Notify if adjustment was made
+                if self.num_workers != original_workers:
+                    print(f"Adjusted worker count from {original_workers} to {self.num_workers} "
+                          f"for even distribution across {self.device_manager.num_gpus} GPUs.")
+            else:
+                # No GPUs, use specified count
+                self.num_workers = num_workers
+        else:
+            # Default to CPU count
+            cpu_count = os.cpu_count() or 8
+            
+            # If GPUs are available, ensure worker count is divisible by GPU count
+            if self.device_manager.num_gpus > 0:
+                # Calculate workers per GPU and ensure at least 2 per GPU if possible
+                workers_per_gpu = max(2, cpu_count // self.device_manager.num_gpus)
+                self.num_workers = workers_per_gpu * self.device_manager.num_gpus
+            else:
+                self.num_workers = cpu_count
+        
+        # Print worker distribution
+        if self.device_manager.num_gpus > 0:
+            workers_per_gpu = self.num_workers / self.device_manager.num_gpus
+            print(f"Using {self.num_workers} worker processes ({workers_per_gpu:.1f} per GPU)")
+        else:
+            print(f"Using {self.num_workers} worker processes (CPU only)")
         
         # Generate experiment name if none provided
         if experiment_name is None:

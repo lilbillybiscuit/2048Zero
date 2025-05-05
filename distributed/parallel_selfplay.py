@@ -19,12 +19,12 @@ from zeromonitoring import EpochStats
 from .gpu_utils import DeviceManager, seed_everything
 
 # Set default multiprocessing start method for PyTorch compatibility
-try:
-    # Use 'spawn' for better compatibility across platforms
-    multiprocessing.set_start_method('spawn')
-except RuntimeError:
-    # Method already set
-    pass
+# Note: This is critical for CUDA compatibility
+if __name__ == "__main__":
+    try:
+        multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        pass
 
 
 def play_single_game(
@@ -161,7 +161,10 @@ class MultiprocessSelfPlayWorker:
         print(f"Launching {self.num_workers} self-play worker processes")
         start_time = time.time()
         
-        with multiprocessing.Pool(self.num_workers) as pool:
+        # Create a fresh process pool with the 'spawn' method for CUDA compatibility
+        # The 'fork' method can cause issues with CUDA
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(self.num_workers) as pool:
             pool.starmap(self._worker_process, worker_args)
         
         # Collect samples and statistics from all workers
@@ -243,8 +246,28 @@ class MultiprocessSelfPlayWorker:
             rules = GameRules()
             
             # Load model
+            # Always load to CPU first, then explicitly move to the target device
+            # This is important for CUDA compatibility with multiprocessing
             model = ZeroNetwork(rules.height, rules.width, 16)  # 16 for max tile exponent
             model.load_state_dict(torch.load(model_path, map_location='cpu'))
+            
+            # If using CUDA, handle possible CUDA initialization issues
+            if device.startswith('cuda'):
+                try:
+                    # Try to ensure CUDA is initialized before model transfer
+                    if not torch.cuda.is_initialized():
+                        torch.cuda.init()
+                    
+                    # Get device index and check if it's valid
+                    device_idx = int(device.split(':')[1]) if ':' in device else 0
+                    if device_idx >= torch.cuda.device_count():
+                        print(f"Warning: Worker {worker_id} - CUDA device {device_idx} not available, falling back to CPU")
+                        device = 'cpu'
+                except Exception as e:
+                    print(f"CUDA error in worker {worker_id}: {e}. Falling back to CPU.")
+                    device = 'cpu'
+            
+            # Now move model to device
             model = model.to(device)
             model.eval()  # Set to evaluation mode
             
