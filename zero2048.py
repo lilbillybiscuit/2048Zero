@@ -258,40 +258,6 @@ class ZeroPlayer:
             n.visits += 1
             n.value_sum += leaf_value
 
-def to_one_hot(board: np.ndarray, num_classes: int) -> np.ndarray:
-    """Convert a board (or batch of boards) to one-hot encoding
-    
-    Args:
-        board: Board array of shape (height, width) or batch of boards of shape (batch_size, height, width)
-        num_classes: Number of classes for one-hot encoding
-        
-    Returns:
-        One-hot encoded board(s) with shape (1, num_classes, height, width) or 
-        (batch_size, num_classes, height, width)
-    """
-    # Check if input is a single board or a batch
-    if len(board.shape) == 2:
-        # Single board
-        height, width = board.shape
-        result = np.zeros((1, num_classes, height, width), dtype=np.float32)
-        for i in range(height):
-            for j in range(width):
-                if board[i, j] > 0:
-                    idx = min(int(board[i, j]), num_classes-1)
-                    result[0, idx, i, j] = 1.0
-        return result
-    else:
-        # Batch of boards
-        batch_size, height, width = board.shape
-        result = np.zeros((batch_size, num_classes, height, width), dtype=np.float32)
-        for b in range(batch_size):
-            for i in range(height):
-                for j in range(width):
-                    if board[b, i, j] > 0:
-                        idx = min(int(board[b, i, j]), num_classes-1)
-                        result[b, idx, i, j] = 1.0
-        return result
-
 class ZeroTrainer:
     def __init__(self, 
                  model: ZeroNetwork, 
@@ -371,14 +337,8 @@ class ZeroTrainer:
 
             while not self.rules.is_terminal(state.board):
                 turn_count += 1
-                
-                # Play a move using the current state
                 action, (pi_probs, value_est) = self.player.play(state, simulations=simulations)
-                
-                # Track action counts
                 action_counts[action] += 1
-                
-                # Store the board and policy probabilities
                 trajectory.append((state.board.copy(), pi_probs))
 
                 # Calculate statistics
@@ -391,19 +351,14 @@ class ZeroTrainer:
                     val_est=f"{value_est:.2f}"
                 )
 
-                # Apply the chosen move and add random tiles
                 new_board, gain = self.rules.apply_move(state.board, action)
                 new_board = self.rules.add_random_tiles(new_board)
-                
-                # Create a new state with updated board, score, and bitboard
                 new_bitboard = BitBoard.from_numpy(new_board)
                 state = GameState(new_board, state.score + gain, new_bitboard)
 
-            # Game is terminal, calculate final statistics
             max_tile = self.rules.get_max_tile(state.board)
             z = math.log2(int(max_tile) + 1) / 11.0 * 2 - 1  # scaled into [-1,1]
-            
-            # Update game statistics
+
             stats.update_game_stats(
                 score=state.score,
                 max_tile=max_tile,
@@ -430,14 +385,11 @@ class ZeroTrainer:
                     action_dist=action_dist
                 )
 
-            # Create training samples with value target z
             for (board_t, pi_t) in trajectory:
                 samples.append((board_t, pi_t, z))
-        
-        # Update samples count in stats
+
         stats.update_samples(len(samples))
-        
-        # Return samples and statistics dictionary
+
         return samples, stats.get_stats()
     
     def _update_network(self, samples: List[Tuple], optimizer: torch.optim.Optimizer, 
@@ -454,11 +406,9 @@ class ZeroTrainer:
             Tuple of (average_loss, average_policy_loss, average_value_loss)
         """
         self.model.train()
-        
-        # Shuffle samples to improve training stability
+
         random.shuffle(samples)
-        
-        # Calculate number of batches
+
         num_samples = len(samples)
         num_batches = (num_samples + batch_size - 1) // batch_size  # Ceiling division
         
@@ -481,22 +431,15 @@ class ZeroTrainer:
             
             # Stack boards and convert to numpy array
             boards_array = np.stack(boards, axis=0)  # Shape: (batch_size, height, width)
-            
-            # Convert boards to one-hot encoding in a single batch operation
-            boards_onehot = to_one_hot(boards_array, self.model.k)  # Shape: (batch_size, num_classes, height, width)
-            
-            # Create tensors for training
-            state_tensor = torch.tensor(boards_onehot, dtype=torch.float32).to(device)
+
+            state_tensor = self.model.to_onehot(boards_array).to(device)
             pi_tensor = torch.tensor(pis, dtype=torch.float32).to(device)
             z_tensor = torch.tensor(zs, dtype=torch.float32).unsqueeze(1).to(device)
 
-            # Zero gradients before forward pass
             optimizer.zero_grad()
-            
-            # Forward pass
+
             p_pred, v_pred = self.model(state_tensor)
-            
-            # Calculate losses
+
             policy_loss = -(pi_tensor * torch.log(p_pred + 1e-8)).sum(dim=1).mean()
             value_loss = torch.nn.functional.mse_loss(v_pred, z_tensor)
             loss = policy_loss + value_loss

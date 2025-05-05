@@ -102,15 +102,15 @@ class ZeroNetwork(nn.Module):
 
         return policy_out, value_out
 
-    def _to_onehot(self, board: np.ndarray) -> torch.Tensor:
+    def to_onehot(self, board: np.ndarray) -> torch.Tensor:
         # board is batch x k x n x m
-        onehot = torch.tensor(board, dtype = torch.long, device = self.infer_device)
+        onehot = torch.tensor(board, dtype = torch.long)
         oh = F.one_hot(onehot, num_classes=self.k).permute(0,3,1,2).float()
         return oh
 
     def infer(self, board: np.ndarray) -> Tuple[np.ndarray, float]:
         batch_size = len(board)
-        p, v= self.forward(self._to_onehot(board))
+        p, v= self.forward(self.to_onehot(board).to(self.infer_device))
         p = p.detach().cpu().reshape(batch_size, 4).numpy()
         v = v.detach().cpu().reshape(batch_size).numpy()
         return p, v
