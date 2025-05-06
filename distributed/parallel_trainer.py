@@ -1,5 +1,5 @@
 """
-Parallel trainer implementation for distributed AlphaZero 2048
+Simplified trainer implementation for AlphaZero 2048
 """
 
 import os
@@ -12,15 +12,13 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from zero import GameRules, ZeroNetwork,  ZeroMonitor, EpochStats, print_epoch_summary
+from zero import GameRules, ZeroNetwork, ZeroMonitor
 
-from .parallel_selfplay import MultiprocessSelfPlayWorker
-from .gpu_utils import DeviceManager, seed_everything
-from .cuda_utils import cuda_operation_timeout
+from .parallel_selfplay import MultiprocessSelfPlayWorker, worker_process
 
 
 class ParallelZeroTrainer:
-    """Enhanced ZeroTrainer that uses parallel self-play for improved performance"""
+    """Simplified ZeroTrainer that uses parallel self-play for training"""
     
     def __init__(
         self,
@@ -31,10 +29,11 @@ class ParallelZeroTrainer:
         experiment_name: Optional[str] = None,
         num_workers: int = None,  # Default to CPU count
         seed: int = 42,
-        reward_function = None  # Custom reward function
+        reward_function = None,
+        enable_monitoring: bool = True
     ):
         """
-        Initialize the trainer with model, rules and parallel settings
+        Initialize the trainer with model and rules
         
         Args:
             model: Neural network model
@@ -44,68 +43,34 @@ class ParallelZeroTrainer:
             experiment_name: Experiment name for wandb
             num_workers: Number of worker processes for parallel self-play
             seed: Random seed for initialization
-            reward_function: Custom function to calculate reward value with signature:
-                            reward_function(state, game_stats) -> (reward_value, reward_name)
+            reward_function: Custom function to calculate reward value
+            enable_monitoring: Whether to enable the visualization web server
         """
         self.model = model
         self.rules = rules
         self.seed = seed
         self.reward_function = reward_function
+        self.enable_monitoring = enable_monitoring
         
         # Set the random seed for reproducibility
-        seed_everything(seed)
+        import random
+        import numpy as np
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
         
-        # Set up device manager first to get GPU count
-        self.device_manager = DeviceManager()
-        
-        # Set number of workers
-        if num_workers is not None:
-            # User specified a worker count
-            original_workers = num_workers
-            
-            # If GPUs are available, automatically round to ensure even distribution
-            if self.device_manager.num_gpus > 0:
-                # Calculate workers per GPU and round down to ensure even distribution
-                workers_per_gpu = num_workers // self.device_manager.num_gpus
-                # If workers_per_gpu is at least 1, adjust total count
-                if workers_per_gpu >= 1:
-                    self.num_workers = workers_per_gpu * self.device_manager.num_gpus
-                else:
-                    # If fewer workers than GPUs, use at least one worker per GPU
-                    self.num_workers = self.device_manager.num_gpus
-                
-                # Notify if adjustment was made
-                if self.num_workers != original_workers:
-                    print(f"Adjusted worker count from {original_workers} to {self.num_workers} "
-                          f"for even distribution across {self.device_manager.num_gpus} GPUs.")
-            else:
-                # No GPUs, use specified count
-                self.num_workers = num_workers
-        else:
-            # Default to CPU count
-            cpu_count = os.cpu_count() or 8
-            
-            # If GPUs are available, ensure worker count is divisible by GPU count
-            if self.device_manager.num_gpus > 0:
-                # Calculate workers per GPU and ensure at least 2 per GPU if possible
-                workers_per_gpu = max(2, cpu_count // self.device_manager.num_gpus)
-                self.num_workers = workers_per_gpu * self.device_manager.num_gpus
-            else:
-                self.num_workers = cpu_count
-        
-        # Print worker distribution
-        if self.device_manager.num_gpus > 0:
-            workers_per_gpu = self.num_workers / self.device_manager.num_gpus
-            print(f"Using {self.num_workers} worker processes ({workers_per_gpu:.1f} per GPU)")
-        else:
-            print(f"Using {self.num_workers} worker processes (CPU only)")
+        # Set number of workers - simple version
+        self.num_workers = num_workers if num_workers is not None else os.cpu_count()
+        print(f"Using {self.num_workers} worker processes")
         
         # Generate experiment name if none provided
         if experiment_name is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             board_size = f"{rules.height}x{rules.width}"
             model_size = f"f{model.conv1.out_channels}_b{len(model.blocks)}"
-            experiment_name = f"zero_parallel_{board_size}_{model_size}_{timestamp}"
+            experiment_name = f"zero_{board_size}_{model_size}_{timestamp}"
+        
+        self.experiment_name = experiment_name
             
         # Initialize monitoring
         config = {
@@ -119,6 +84,7 @@ class ParallelZeroTrainer:
             "reward_function": "custom" if self.reward_function else "default_score"
         }
         
+        # Initialize wandb monitoring
         self.monitor = ZeroMonitor(
             use_wandb=use_wandb,
             project_name=project_name,
@@ -134,10 +100,19 @@ class ParallelZeroTrainer:
         # Model path for sharing with workers
         self.model_path = f"{self.temp_dir}/current_model.pth"
         self.save_model()
+        
+        # Initialize web monitor if enabled
+        if self.enable_monitoring:
+            try:
+                from visual.monitor_client import start_monitor_server
+                self.monitor_running = start_monitor_server(host='0.0.0.0', port=5000, open_browser=True)
+                print("Monitoring server started at http://localhost:5000")
+            except Exception as e:
+                print(f"Warning: Monitoring server could not be started: {e}")
+                self.monitor_running = False
     
     def save_model(self):
         """Save the current model to the shared model path"""
-        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         torch.save(self.model.state_dict(), self.model_path)
     
     def _collect_selfplay_data_parallel(
@@ -156,7 +131,7 @@ class ParallelZeroTrainer:
             Tuple of (samples, statistics)
         """
         # Save current model for workers to use
-        self.model.eval()  # Set to evaluation mode
+        self.model.eval()
         self.save_model()
         
         # Calculate games per worker (distribute evenly)
@@ -166,7 +141,7 @@ class ParallelZeroTrainer:
         if actual_games != games_per_epoch:
             print(f"Note: Adjusted games from {games_per_epoch} to {actual_games} for even distribution")
         
-        # Create and run parallel self-play worker with custom reward function
+        # Create and run parallel self-play worker
         worker = MultiprocessSelfPlayWorker(
             model_path=self.model_path,
             num_workers=self.num_workers,
@@ -174,7 +149,8 @@ class ParallelZeroTrainer:
             simulations_per_move=simulations,
             temp_dir=self.temp_dir,
             seed=self.seed,
-            reward_function=self.reward_function
+            reward_function=self.reward_function,
+            enable_monitoring=self.enable_monitoring
         )
         
         # Generate games in parallel
@@ -187,7 +163,8 @@ class ParallelZeroTrainer:
         samples: List[Tuple], 
         optimizer: torch.optim.Optimizer, 
         batch_size: int, 
-        epoch: int
+        epoch: int,
+        device: str = 'cuda:0'
     ) -> Tuple[float, float, float]:
         """
         Update neural network weights using collected samples in batches
@@ -197,32 +174,21 @@ class ParallelZeroTrainer:
             optimizer: PyTorch optimizer
             batch_size: Training batch size
             epoch: Current epoch number (for logging)
+            device: Device to use for training
             
         Returns:
             Tuple of (average_loss, average_policy_loss, average_value_loss)
         """
         self.model.train()
         
-        # Move model to best available device with anti-deadlock protections
-        device = self.device_manager.get_best_device()
+        # Move model to specified device
+        if not torch.cuda.is_available() and device.startswith('cuda'):
+            device = 'cpu'
+            print("CUDA not available, using CPU for training")
+            
+        self.model.to(device)
         
-        # Use timeout protection for CUDA devices
-        if device.startswith('cuda'):
-            try:
-                # Simple initialization without complex operations
-                device_idx = int(device.split(':')[1]) if ':' in device else 0
-                torch.cuda.set_device(device_idx)
-                
-                # Don't call any complex CUDA operations before moving model
-                # Just move the model with timeout protection
-                with cuda_operation_timeout(seconds=30):
-                    self.model.to(device)
-            except Exception as e:
-                # If anything fails, fail immediately - no retries
-                raise RuntimeError(f"CUDA error during model transfer: {e}")
-        else:
-            self.model.to(device)
-
+        # Shuffle samples
         random.shuffle(samples)
 
         num_samples = len(samples)
@@ -245,17 +211,18 @@ class ParallelZeroTrainer:
             # Unpack batch
             boards, pis, zs = zip(*batch)
             
-            # Stack boards and convert to tensors
-            boards_array = np.stack(boards, axis=0)  # Shape: (batch_size, height, width)
-
+            # Convert to tensors
+            boards_array = np.stack(boards, axis=0)
             state_tensor = self.model.to_onehot(boards_array).to(device)
             pi_tensor = torch.tensor(pis, dtype=torch.float32).to(device)
             z_tensor = torch.tensor(zs, dtype=torch.float32).unsqueeze(1).to(device)
 
             optimizer.zero_grad()
 
+            # Forward pass
             p_pred, v_pred = self.model(state_tensor)
 
+            # Compute losses
             policy_loss = -(pi_tensor * torch.log(p_pred + 1e-8)).sum(dim=1).mean()
             value_loss = torch.nn.functional.mse_loss(v_pred, z_tensor)
             loss = policy_loss + value_loss
@@ -282,7 +249,7 @@ class ParallelZeroTrainer:
                 'v_loss': f'{current_value_loss:.4f}'
             })
             
-            # Log batch metrics using the monitor
+            # Log batch metrics
             self.monitor.log_batch_stats(
                 batch_loss=current_loss,
                 batch_policy_loss=current_policy_loss,
@@ -306,7 +273,6 @@ class ParallelZeroTrainer:
         lr: float = 0.001,
         log_interval: int = 1,
         checkpoint_interval: int = 10,
-        resume: bool = False,
         **kwargs
     ):
         """
@@ -319,15 +285,16 @@ class ParallelZeroTrainer:
             lr: Learning rate for optimizer
             log_interval: How often to log detailed metrics
             checkpoint_interval: How often to save model checkpoints
-            resume: Whether to resume training from previous state
             **kwargs: Additional arguments
         """
-        # Create checkpoint directory if it doesn't exist
-        if not os.path.exists("checkpoints"):
-            os.makedirs("checkpoints")
+        # Select training device
+        if torch.cuda.is_available():
+            device = 'cuda:0'
+        else:
+            device = 'cpu'
             
-        # Update monitor config with training parameters
-        config_update = {
+        # Initialize monitor config with training parameters
+        self.monitor.config.update({
             "epochs": epochs,
             "games_per_epoch": games_per_epoch,
             "batch_size": batch_size,
@@ -336,49 +303,28 @@ class ParallelZeroTrainer:
             "scheduler_gamma": kwargs.get('scheduler_gamma', 0.5),
             "simulations": kwargs.get('simulations', 50),
             "weight_decay": kwargs.get('weight_decay', 1e-4),
-            "num_workers": self.num_workers
-        }
-        self.monitor.config.update(config_update)
+            "num_workers": self.num_workers,
+            "device": device
+        })
         
         # Initialize wandb with the model
         if self.monitor.use_wandb and not self.monitor.wandb_initialized:
             self.monitor.init_wandb(watch_model=self.model)
         
-        # Initialize optimizer with specified learning rate
+        # Initialize optimizer
         optimizer = torch.optim.SGD(
             self.model.parameters(),
             lr=lr,
             momentum=0.9,
-            weight_decay=config_update["weight_decay"]
+            weight_decay=kwargs.get('weight_decay', 1e-4)
         )
         
-        # Add learning rate scheduler for better convergence
+        # Learning rate scheduler
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer,
-            step_size=config_update["scheduler_step_size"],
-            gamma=config_update["scheduler_gamma"]
+            step_size=kwargs.get('scheduler_step_size', 20),
+            gamma=kwargs.get('scheduler_gamma', 0.5)
         )
-        
-        # Create a run tracker file to allow resume
-        self.monitor.run_data.update({
-            "model_config": {
-                "filters": self.model.conv1.out_channels,
-                "blocks": len(self.model.blocks),
-                "k": self.model.k
-            },
-            "board_config": {
-                "height": self.rules.height,
-                "width": self.rules.width
-            },
-            "training_config": {
-                "epochs": epochs,
-                "games_per_epoch": games_per_epoch,
-                "batch_size": batch_size,
-                "lr": lr,
-                "num_workers": self.num_workers,
-                "seed": self.seed
-            }
-        })
         
         # Training loop
         for epoch in range(epochs):
@@ -386,22 +332,36 @@ class ParallelZeroTrainer:
             
             # 1. Collect training data with parallel self-play
             print(f"Epoch {epoch+1}/{epochs}")
-            self.model.eval()  # Set to evaluation mode for self-play
             
             samples, epoch_stats = self._collect_selfplay_data_parallel(
                 games_per_epoch=games_per_epoch,
                 simulations=kwargs.get('simulations', 50)
             )
             
-            # Log self-play statistics to wandb
+            # Log self-play statistics
             self.monitor.log_selfplay_stats(epoch_stats, epoch)
+            
+            # Update monitoring server if enabled
+            if self.enable_monitoring:
+                try:
+                    from visual.monitor_client import update_training_stats
+                    update_training_stats(
+                        current_epoch=epoch+1,
+                        total_epochs=epochs,
+                        samples_collected=len(samples),
+                        games_played=epoch_stats.get('games', 0),
+                        max_tile_achieved=epoch_stats.get('max_tile', 0),
+                        max_score=epoch_stats.get('max_score', 0)
+                    )
+                except:
+                    pass  # Silently fail if monitoring update fails
             
             # 2. Update neural network if samples were collected
             loss, pi_loss, v_loss = None, None, None
             if samples:
-                # Update network with batched training
+                # Train on all collected samples
                 loss, pi_loss, v_loss = self._update_network(
-                    samples, optimizer, batch_size, epoch=epoch
+                    samples, optimizer, batch_size, epoch=epoch, device=device
                 )
                 
                 # Step the learning rate scheduler
@@ -417,49 +377,36 @@ class ParallelZeroTrainer:
                     epoch=epoch
                 )
                 
+                # Update monitoring server with loss metrics
+                if self.enable_monitoring:
+                    try:
+                        from visual.monitor_client import update_training_stats
+                        update_training_stats(
+                            current_epoch=epoch+1,
+                            total_epochs=epochs,
+                            latest_loss=loss,
+                            policy_loss=pi_loss,
+                            value_loss=v_loss
+                        )
+                    except:
+                        pass  # Silently fail if monitoring update fails
+                
                 # Save the updated model for next epoch
                 self.save_model()
             
             # Calculate epoch time
             epoch_time = time.time() - epoch_start_time
             
-            # Print a summary of the epoch results
+            # Print epoch summary
             max_tile = epoch_stats.get('max_tile', 0)
             max_score = epoch_stats.get('max_score', 0)
             avg_score = epoch_stats.get('total_score', 0) / max(1, epoch_stats.get('games', 1))
             loss_str = f"{loss:.4f}" if loss is not None else "N/A"
-            reward_type = epoch_stats.get('reward_type', 'unknown')
             
-            # Include reward type in the summary
             print(f"Epoch {epoch+1} summary: MaxScore={max_score}, MaxTile={max_tile}, " +
-                 f"AvgScore={avg_score:.1f}, Loss={loss_str}, " +
-                 f"Reward={reward_type}, Time={epoch_time:.1f}s")
+                 f"AvgScore={avg_score:.1f}, Loss={loss_str}, Time={epoch_time:.1f}s")
             
-            # Prepare epoch data for run tracker
-            epoch_data = {
-                "epoch": epoch,
-                "samples": len(samples),
-                "max_tile": epoch_stats.get('max_tile', 0),
-                "max_score": epoch_stats.get('max_score', 0),
-                "avg_tile": epoch_stats.get('total_tile', 0) / max(1, epoch_stats.get('games', 1)),
-                "avg_score": epoch_stats.get('total_score', 0) / max(1, epoch_stats.get('games', 1)),
-                "avg_turns": epoch_stats.get('total_turns', 0) / max(1, epoch_stats.get('games', 1)),
-                "loss": loss if samples else None,
-                "policy_loss": pi_loss if samples else None,
-                "value_loss": v_loss if samples else None,
-                "learning_rate": scheduler.get_last_lr()[0] if scheduler else None,
-                "epoch_time_seconds": epoch_time,
-                "reward_type": epoch_stats.get('reward_type', 'unknown')
-            }
-            
-            # Update run tracker
-            self.monitor.update_run_data(epoch_data)
-            
-            # Save run tracker
-            run_path = f"checkpoints/{self.monitor.experiment_name}_run.json"
-            self.monitor.save_run_data(run_path)
-                
-            # 3. Save checkpoint periodically
+            # Save checkpoint periodically
             if epoch % checkpoint_interval == 0 or epoch == epochs - 1:
                 checkpoint_path = f"checkpoints/{self.monitor.experiment_name}_epoch_{epoch}.pth"
                 self.model.save(checkpoint_path)
@@ -467,16 +414,8 @@ class ParallelZeroTrainer:
                 
                 # Log model to wandb
                 self.monitor.log_checkpoint(checkpoint_path)
-            
-            # 4. Log example boards to wandb periodically
-            if self.monitor.use_wandb and (epoch % log_interval == 0 or epoch == epochs - 1):
-                # Extract some example boards from training samples
-                if samples:
-                    sample_indices = list(range(0, len(samples), max(1, len(samples)//8)))[:8]
-                    board_examples = [samples[i][0] for i in sample_indices]
-                    self.monitor.log_board_examples(board_examples, f"epoch_{epoch}_boards")
-        
+                
         # Finish wandb run when training is complete
         self.monitor.finish()
         
-        return self.monitor.run_data
+        return self.monitor

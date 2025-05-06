@@ -1,17 +1,15 @@
 #!/usr/bin/env python
 """
-Parallel training script for AlphaZero 2048
+Simplified parallel training script for AlphaZero 2048
 """
 
 import os
 import argparse
 import torch
 
-# Original implementation is now thread-safe
-
 from zero.game import GameRules
 from zero.zeromodel import ZeroNetwork
-from distributed import ParallelZeroTrainer, DeviceManager
+from distributed import ParallelZeroTrainer
 from zero.reward_functions import score_reward_func, hybrid_reward_func
 
 def main():
@@ -28,12 +26,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--simulations", type=int, default=50, help="MCTS simulations per move")
-    parser.add_argument("--accelerator", type=str, choices=["cuda", "mps", "cpu"], 
-                        help="Force a specific accelerator ('cuda', 'mps', or 'cpu')")
     
     # Parallel settings
     parser.add_argument("--workers", type=int, default=None, 
-                      help="Number of worker processes (default: auto-calculated based on CPU/GPU count)")
+                      help="Number of worker processes (default: CPU count)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
     # Checkpointing
@@ -42,37 +38,20 @@ def main():
     
     # WandB settings
     parser.add_argument("--use-wandb", action="store_true", help="Use Weights & Biases for logging")
-    parser.add_argument("--project-name", type=str, default="2048-zero-parallel", help="WandB project name")
+    parser.add_argument("--project-name", type=str, default="2048-zero", help="WandB project name")
     parser.add_argument("--experiment-name", type=str, default=None, help="WandB experiment name")
+    
+    # Visualization
+    parser.add_argument("--enable-monitor", action="store_true", help="Enable web-based monitoring visualization")
     
     args = parser.parse_args()
     
     # Create game rules
     rules = GameRules()
     
-    # Initialize device manager
-    device_manager = DeviceManager()
-    
-    # Handle forced accelerator if specified
-    if args.accelerator:
-        if args.accelerator == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA accelerator requested but not available on this system")
-        elif args.accelerator == "mps" and not torch.backends.mps.is_available():
-            raise RuntimeError("MPS accelerator requested but not available on this system")
-            
-        best_device = args.accelerator
-        print(f"Using forced accelerator: {best_device}")
-        
-        # Set appropriate environment variable
-        if args.accelerator == "cuda":
-            os.environ["FORCE_CUDA"] = "1"
-        elif args.accelerator == "mps":
-            os.environ["FORCE_MPS"] = "1"
-        elif args.accelerator == "cpu":
-            os.environ["FORCE_CPU"] = "1"
-    else:
-        best_device = device_manager.get_best_device()
-        print(f"Using auto-selected device: {best_device}")
+    # Select device
+    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
     
     # Initialize model
     if args.checkpoint and os.path.exists(args.checkpoint):
@@ -83,12 +62,10 @@ def main():
         print(f"Initializing new model with {args.filters} filters, {args.blocks} blocks")
         model = ZeroNetwork(rules.height, rules.width, 16, filters=args.filters, blocks=args.blocks)
     
-    # Move model to best device
-    model = model.to(best_device)
+    # Move model to device
+    model = model.to(device)
     
-    # We use unified module-level functions for reward calculation
-    
-    # Create trainer with specified number of workers
+    # Create trainer with simplified interface
     trainer = ParallelZeroTrainer(
         model=model,
         rules=rules,
@@ -97,7 +74,8 @@ def main():
         experiment_name=args.experiment_name,
         num_workers=args.workers,
         seed=args.seed,
-        reward_function=hybrid_reward_func
+        reward_function=hybrid_reward_func,  # Using the hybrid reward function by default
+        enable_monitoring=args.enable_monitor
     )
     
     # Run training
