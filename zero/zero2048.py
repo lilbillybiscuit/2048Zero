@@ -162,15 +162,38 @@ class ZeroPlayer:
         action = player.play(start_state, time_limit=0.1)
     """
 
-    def __init__(self, model: ZeroNetwork, rules: GameRules, dirichlet_eps: float = 0.25, dirichlet_alpha: float = 0.3):
+    def __init__(self, model: ZeroNetwork, rules: GameRules, dirichlet_eps: float = 0.25, dirichlet_alpha: float = 0.5, temperature: float = 1.0):
+        """
+        Initialize the ZeroPlayer with model, rules and search parameters
+        
+        Args:
+            model: Neural network model
+            rules: Game rules
+            dirichlet_eps: Weight of Dirichlet noise added to root prior (0.0-1.0)
+            dirichlet_alpha: Concentration parameter for Dirichlet distribution (lower=peakier)
+            temperature: Temperature for action selection (1.0=normal, <1.0=more deterministic)
+        """
         self.model = model
         self.rules = rules
         self.dir_eps = dirichlet_eps
         self.dir_alpha = dirichlet_alpha
+        self.temperature = temperature
         # Cache for board evaluation to avoid redundant neural network inference
         self._value_cache = {}
 
-    def play(self, state: GameState, time_limit: float = 0.5, simulations: Optional[int] = None) -> Tuple[int, ZeroProbs]:
+    def play(self, state: GameState, time_limit: float = 0.5, simulations: Optional[int] = None, temperature: Optional[float] = None) -> Tuple[int, ZeroProbs]:
+        """
+        Run MCTS search and select an action
+        
+        Args:
+            state: Current game state
+            time_limit: Time limit in seconds (ignored if simulations is provided)
+            simulations: Number of MCTS simulations to run
+            temperature: Override the default temperature for this move
+        
+        Returns:
+            Tuple of (selected_action, (action_probabilities, value_estimate))
+        """
         # Create the root node with the GameState
         root = ZeroMCTSNode(ZeroMCTSNode.PLAYER, self.model, self.rules, state)
         self._add_dirichlet_noise(root)
@@ -186,7 +209,35 @@ class ZeroPlayer:
             self._backprop(path, leaf_value)
             sims_done += 1
 
-        best_action = max(root.children.items(), key=lambda kv: kv[1].visits)[0]
+        # Temperature-based action selection
+        temp = temperature if temperature is not None else self.temperature
+        # For turn count, we'll use a simple heuristic based on score if history not available
+        # In 2048, score roughly corresponds to number of moves made
+        turn_count = int(state.score / 10) if not hasattr(state, 'get_history') else len(state.get_history())
+        
+        # Use temperature-based selection for exploration vs. exploitation
+        # Lower temperature for later game stages (more deterministic)
+        if turn_count >= 15:
+            temp = min(temp, 0.5)  # More focused play in mid-to-late game
+
+        if temp < 0.05 or turn_count > 30:
+            # Deterministic selection for very low temperature or endgame
+            best_action = max(root.children.items(), key=lambda kv: kv[1].visits)[0]
+        else:
+            # Sample based on visit count distribution and temperature
+            visits = np.array([child.visits for _, child in sorted(root.children.items())])
+            actions = np.array(sorted(root.children.keys()))
+            
+            # Apply temperature scaling
+            if temp != 1.0:
+                visits = visits ** (1.0 / temp)
+                
+            # Normalize to probabilities
+            probs = visits / visits.sum()
+            
+            # Random sampling based on the distribution
+            best_action = np.random.choice(actions, p=probs)
+            
         return best_action, root.get_probs()
 
     def _add_dirichlet_noise(self, root: ZeroMCTSNode):
@@ -232,9 +283,18 @@ class ZeroPlayer:
 
     def _evaluate_leaf(self, node: ZeroMCTSNode) -> float:
         if node.is_terminal:
-            # For terminal nodes, use the score as basis for reward
-            # This normalizes the score using log scale, similar to our default reward function
-            return math.log2(node.score) if node.score > 0 else 0.0
+            # Use the same reward function as training for consistency
+            from zero.reward_functions import default_reward_func
+            # Convert bitboard to numpy for max_tile calculation
+            np_board = BitBoard.to_numpy(node.bitboard, node.height, node.width)
+            # Create game stats structure matching what's used in training
+            game_stats = {
+                'score': node.score,
+                'max_tile': node.rules.get_max_tile(np_board)
+            }
+            # Calculate reward using same function as training
+            z, _ = default_reward_func(node, game_stats)
+            return z
 
         if node.bitboard in self._value_cache:
             return self._value_cache[node.bitboard]
@@ -461,9 +521,9 @@ class ZeroTrainer:
             # Stack boards and convert to numpy array
             boards_array = np.stack(boards, axis=0)  # Shape: (batch_size, height, width)
 
-            state_tensor = self.model.to_onehot(boards_array).to(device)
-            pi_tensor = torch.tensor(pis, dtype=torch.float32).to(device)
-            z_tensor = torch.tensor(zs, dtype=torch.float32).unsqueeze(1).to(device)
+            state_tensor = self.model.to_onehot(boards_array, device=device)
+            pi_tensor = torch.tensor(pis, dtype=torch.float32, device=device)
+            z_tensor = torch.tensor(zs, dtype=torch.float32, device=device).unsqueeze(1)
 
             optimizer.zero_grad()
 

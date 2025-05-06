@@ -112,7 +112,11 @@ class MultiprocessSelfPlayWorker:
         simulations_per_move: int = 50,
         temp_dir: str = "temp_data",
         seed: int = 42,
-        reward_function = None  # Custom reward function
+        reward_function = None,  # Custom reward function
+        dirichlet_eps: float = 0.25,
+        dirichlet_alpha: float = 0.5,
+        temperature: float = 1.0,
+        use_compile: bool = False  # Use torch.compile for model in workers
     ):
         """
         Initialize the self-play worker
@@ -125,6 +129,10 @@ class MultiprocessSelfPlayWorker:
             temp_dir: Directory for temporary data storage
             seed: Random seed for initialization
             reward_function: Custom function to calculate reward value
+            dirichlet_eps: Weight of Dirichlet noise added to root node (exploration)
+            dirichlet_alpha: Concentration parameter for Dirichlet noise 
+            temperature: Temperature parameter for action selection
+            use_compile: Whether to use torch.compile to optimize the model
         """
         self.model_path = model_path
         self.num_workers = num_workers if num_workers is not None else multiprocessing.cpu_count()
@@ -133,6 +141,10 @@ class MultiprocessSelfPlayWorker:
         self.temp_dir = temp_dir
         self.seed = seed
         self.reward_function = reward_function
+        self.dirichlet_eps = dirichlet_eps
+        self.dirichlet_alpha = dirichlet_alpha
+        self.temperature = temperature
+        self.use_compile = use_compile
         
         # Create temp directory if it doesn't exist
         os.makedirs(self.temp_dir, exist_ok=True)
@@ -166,7 +178,11 @@ class MultiprocessSelfPlayWorker:
                 f"{self.temp_dir}/worker_{worker_id}_stats.pkl",
                 device,
                 worker_seed,
-                self.reward_function  # Pass the reward_function to worker
+                self.reward_function,  # Pass the reward_function to worker
+                self.dirichlet_eps,    # Pass exploration parameters
+                self.dirichlet_alpha,
+                self.temperature,
+                self.use_compile       # Pass compile flag
             ))
         
         # Launch worker processes with protection against potential deadlocks
@@ -193,23 +209,21 @@ class MultiprocessSelfPlayWorker:
         combined_stats = self._initialize_combined_stats()
         
         for worker_id in range(self.num_workers):
-            # Load samples
+            # Load samples using torch.load for better performance
             sample_path = f"{self.temp_dir}/worker_{worker_id}_samples.pkl"
             try:
-                with open(sample_path, 'rb') as f:
-                    worker_samples = pickle.load(f)
-                    all_samples.extend(worker_samples)
-            except (FileNotFoundError, EOFError) as e:
+                worker_samples = torch.load(sample_path, weights_only=False)
+                all_samples.extend(worker_samples)
+            except (FileNotFoundError, EOFError, RuntimeError) as e:
                 print(f"Warning: Could not load samples from worker {worker_id}: {e}")
                 continue
             
             # Load statistics
             stats_path = f"{self.temp_dir}/worker_{worker_id}_stats.pkl"
             try:
-                with open(stats_path, 'rb') as f:
-                    worker_stats = pickle.load(f)
-                    self._merge_worker_stats(combined_stats, worker_stats)
-            except (FileNotFoundError, EOFError) as e:
+                worker_stats = torch.load(stats_path, weights_only=False)
+                self._merge_worker_stats(combined_stats, worker_stats)
+            except (FileNotFoundError, EOFError, RuntimeError) as e:
                 print(f"Warning: Could not load stats from worker {worker_id}: {e}")
                 continue
             
@@ -243,7 +257,11 @@ class MultiprocessSelfPlayWorker:
         stats_path: str,
         device: str,
         seed: int,
-        reward_function=None
+        reward_function=None,
+        dirichlet_eps=0.25,
+        dirichlet_alpha=0.5,
+        temperature=1.0,
+        use_compile=False
     ):
         """
         Worker process function that generates self-play games
@@ -269,8 +287,46 @@ class MultiprocessSelfPlayWorker:
             # Load model
             # Always load to CPU first, then explicitly move to the target device
             # This is important for CUDA compatibility with multiprocessing
-            model = ZeroNetwork(rules.height, rules.width, 16)  # 16 for max tile exponent
-            model.load_state_dict(torch.load(model_path, map_location='cpu'))
+            try:
+                # Load model data - might be metadata dict or direct state dict
+                loaded_data = torch.load(model_path, map_location='cpu', weights_only=False)
+                
+                # Check if the loaded data has metadata format
+                if isinstance(loaded_data, dict) and 'state_dict' in loaded_data and 'filters' in loaded_data and 'blocks' in loaded_data:
+                    # New format with metadata
+                    filters = loaded_data['filters']
+                    blocks = loaded_data['blocks']
+                    state_dict = loaded_data['state_dict']
+                    print(f"Worker {worker_id}: Using metadata - filters={filters}, blocks={blocks}")
+                else:
+                    # Old format or direct state dict - determine parameters
+                    state_dict = loaded_data
+                    filters = 8  # Default for small model
+                    
+                    # Try to determine filters from state dict
+                    if 'conv1.weight' in state_dict:
+                        filters = state_dict['conv1.weight'].size(0)
+                    
+                    # Count number of blocks from state_dict
+                    max_block_idx = -1
+                    for k in state_dict.keys():
+                        if k.startswith('blocks.'):
+                            parts = k.split('.')
+                            if len(parts) > 1 and parts[1].isdigit():
+                                block_idx = int(parts[1])
+                                max_block_idx = max(max_block_idx, block_idx)
+                    
+                    blocks = max_block_idx + 1 if max_block_idx >= 0 else 2  # Default fallback
+                    print(f"Worker {worker_id}: Inferred model parameters - filters={filters}, blocks={blocks}")
+                
+                # Create model with correct architecture
+                model = ZeroNetwork(rules.height, rules.width, 16, filters=filters, blocks=blocks)
+                model.load_state_dict(state_dict)
+            except Exception as e:
+                print(f"Worker {worker_id}: Error loading model with exact parameters: {e}")
+                print(f"Worker {worker_id}: Falling back to default model initialization")
+                # Create a fresh model - training will start from scratch
+                model = ZeroNetwork(rules.height, rules.width, 16)
             
             # Initialize CUDA if needed - use anti-deadlock pattern with staggered initialization
             if device.startswith('cuda'):
@@ -300,8 +356,23 @@ class MultiprocessSelfPlayWorker:
                 
             model.eval()
             
-            # Create player (original implementation is now thread-safe)
-            player = ZeroPlayer(model, rules)
+            # Apply torch.compile if requested and available
+            # This needs to happen AFTER device placement and inside the worker process
+            if use_compile:
+                try:
+                    if hasattr(torch, 'compile'):
+                        print(f"Worker {worker_id}: Using torch.compile to optimize model")
+                        model = torch.compile(model, mode="reduce-overhead", dynamic=True)
+                    else:
+                        print(f"Worker {worker_id}: torch.compile not available, skipping optimization")
+                except Exception as e:
+                    print(f"Worker {worker_id}: torch.compile failed - {e}, continuing without compilation")
+            
+            # Create player with exploration parameters
+            player = ZeroPlayer(model, rules,
+                              dirichlet_eps=dirichlet_eps,
+                              dirichlet_alpha=dirichlet_alpha,
+                              temperature=temperature)
             
             # Initialize statistics
             samples = []
@@ -348,12 +419,10 @@ class MultiprocessSelfPlayWorker:
                     # Fail the entire worker process if a game crashes, which will propagate to the main process
                     raise RuntimeError(f"Game {game_idx} failed in worker {worker_id}. Training will be terminated.")
             
-            # Save samples and statistics
-            with open(samples_path, 'wb') as f:
-                pickle.dump(samples, f)
-            
-            with open(stats_path, 'wb') as f:
-                pickle.dump(stats.get_stats(), f)
+            # Save samples and statistics using torch.save for better performance
+            # Especially helpful for GPU tensors (zero-copy) but also faster for regular objects
+            torch.save(samples, samples_path, pickle_protocol=4)
+            torch.save(stats.get_stats(), stats_path, pickle_protocol=4)
                 
         except Exception as e:
             print(f"Worker {worker_id} failed with error: {e}")

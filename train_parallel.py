@@ -12,7 +12,7 @@ import torch
 from zero.game import GameRules
 from zero.zeromodel import ZeroNetwork
 from distributed import ParallelZeroTrainer, DeviceManager
-from zero.reward_functions import score_reward_func, hybrid_reward_func
+from zero.reward_functions import score_reward_func, hybrid_reward_func, dynamic_score_reward_func, get_reward_func
 
 def main():
     # Parse command line arguments
@@ -28,12 +28,24 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--simulations", type=int, default=50, help="MCTS simulations per move")
+    
+    # MCTS exploration parameters
+    parser.add_argument("--dirichlet-eps", type=float, default=0.25, 
+                        help="Weight of Dirichlet noise added to root node (default: 0.25)")
+    parser.add_argument("--dirichlet-alpha", type=float, default=0.5, 
+                        help="Concentration parameter for Dirichlet noise (default: 0.5)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Temperature for action selection (default: 1.0)")
+    
+    # Device selection
     parser.add_argument("--accelerator", type=str, choices=["cuda", "mps", "cpu"], 
                         help="Force a specific accelerator ('cuda', 'mps', or 'cpu')")
     
     # Parallel settings
     parser.add_argument("--workers", type=int, default=None, 
                       help="Number of worker processes (default: auto-calculated based on CPU/GPU count)")
+    parser.add_argument("--workers-per-gpu", type=int, default=3,
+                      help="Maximum number of worker processes per GPU (default: 3)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
     # Checkpointing
@@ -44,6 +56,12 @@ def main():
     parser.add_argument("--use-wandb", action="store_true", help="Use Weights & Biases for logging")
     parser.add_argument("--project-name", type=str, default="2048-zero-parallel", help="WandB project name")
     parser.add_argument("--experiment-name", type=str, default=None, help="WandB experiment name")
+    
+    # Optimization flags
+    parser.add_argument("--use-compile", action="store_true", help="Use torch.compile for model optimization")
+    parser.add_argument("--dynamic-reward", action="store_true", help="Use dynamic reward scaling that adapts to highest observed score")
+    parser.add_argument("--reward-type", type=str, default="hybrid", choices=["score", "max_tile", "hybrid", "dynamic_score"], 
+                        help="Type of reward function to use")
     
     args = parser.parse_args()
     
@@ -78,7 +96,7 @@ def main():
     if args.checkpoint and os.path.exists(args.checkpoint):
         print(f"Loading model from checkpoint: {args.checkpoint}")
         model = ZeroNetwork(rules.height, rules.width, 16, filters=args.filters, blocks=args.blocks)
-        model.load_state_dict(torch.load(args.checkpoint, map_location='cpu'))
+        model.load_state_dict(torch.load(args.checkpoint, map_location='cpu', weights_only=False))
     else:
         print(f"Initializing new model with {args.filters} filters, {args.blocks} blocks")
         model = ZeroNetwork(rules.height, rules.width, 16, filters=args.filters, blocks=args.blocks)
@@ -86,9 +104,17 @@ def main():
     # Move model to best device
     model = model.to(best_device)
     
-    # We use unified module-level functions for reward calculation
+    # Select reward function based on command line args
+    if args.dynamic_reward and args.reward_type != "dynamic_score":
+        print(f"Using dynamic reward scaling with {args.reward_type} reward type")
+        # If dynamic reward is requested but reward type isn't dynamic_score, override it
+        reward_function = dynamic_score_reward_func
+    else:
+        # Otherwise use the selected reward type
+        reward_function = get_reward_func(args.reward_type)
+        print(f"Using reward function: {args.reward_type}")
     
-    # Create trainer with specified number of workers
+    # Create trainer with specified number of workers and exploration parameters
     trainer = ParallelZeroTrainer(
         model=model,
         rules=rules,
@@ -96,14 +122,21 @@ def main():
         project_name=args.project_name,
         experiment_name=args.experiment_name,
         num_workers=args.workers,
+        workers_per_gpu=args.workers_per_gpu,
         seed=args.seed,
-        reward_function=hybrid_reward_func
+        reward_function=reward_function,
+        dirichlet_eps=args.dirichlet_eps,
+        dirichlet_alpha=args.dirichlet_alpha,
+        temperature=args.temperature,
+        use_compile=args.use_compile
     )
     
     # Run training
     print(f"Starting parallel training with {args.workers or 'auto'} workers")
     print(f"Training for {args.epochs} epochs, {args.games_per_epoch} games per epoch")
     print(f"MCTS simulations per move: {args.simulations}")
+    print(f"Exploration parameters: noise={args.dirichlet_eps}, alpha={args.dirichlet_alpha}, temp={args.temperature}")
+    print(f"Optimizations: dynamic_reward={args.dynamic_reward}, torch.compile={args.use_compile}")
     
     trainer.train(
         epochs=args.epochs,

@@ -10,13 +10,19 @@ class BitBoard:
     """Optimized board representation using bit operations for fast processing"""
     @staticmethod
     def from_numpy(board: BoardType) -> int:
+        """
+        Convert numpy board to bitboard representation with safeguards against overflow.
+        Each cell uses 4 bits, with a maximum value of 15 per cell.
+        """
         height, width = board.shape
+        # Use Python's arbitrary-precision integers 
         bitboard = 0
         shift = 0
 
         for r in range(height):
             for c in range(width):
-                value = min(int(board[r, c]), 15)
+                value = min(int(board[r, c]), 15)  # Cap at 15 (uses 4 bits)
+                # Python integers support arbitrary precision, so this is safe
                 bitboard |= (value & 0xF) << shift
                 shift += 4
 
@@ -38,11 +44,14 @@ class BitBoard:
     @staticmethod
     @numba.njit
     def fast_has_valid_moves(bitboard: int, height: int, width: int) -> bool:
-        """Original Numba-accelerated implementation - can cause overflow errors with large bitboards"""
+        """Numba-accelerated implementation with explicit uint64 casting to prevent overflow"""
+        # Cast to uint64 to prevent overflow with large bitboards
+        bb_uint64 = numba.uint64(bitboard)
+        
         # Check for empty cells
         for i in range(height * width):
-            shift = i * 4
-            value = (bitboard >> shift) & 0xF
+            shift = numba.uint64(i * 4)
+            value = numba.uint64(bb_uint64 >> shift) & numba.uint64(0xF)
             if value == 0:
                 return True
 
@@ -51,10 +60,10 @@ class BitBoard:
             for c in range(width - 1):
                 idx1 = r * width + c
                 idx2 = r * width + (c + 1)
-                shift1 = idx1 * 4
-                shift2 = idx2 * 4
-                value1 = (bitboard >> shift1) & 0xF
-                value2 = (bitboard >> shift2) & 0xF
+                shift1 = numba.uint64(idx1 * 4)
+                shift2 = numba.uint64(idx2 * 4)
+                value1 = numba.uint64(bb_uint64 >> shift1) & numba.uint64(0xF)
+                value2 = numba.uint64(bb_uint64 >> shift2) & numba.uint64(0xF)
                 if value1 != 0 and value1 == value2:
                     return True
 
@@ -63,10 +72,10 @@ class BitBoard:
             for r in range(height - 1):
                 idx1 = r * width + c
                 idx2 = (r + 1) * width + c
-                shift1 = idx1 * 4
-                shift2 = idx2 * 4
-                value1 = (bitboard >> shift1) & 0xF
-                value2 = (bitboard >> shift2) & 0xF
+                shift1 = numba.uint64(idx1 * 4)
+                shift2 = numba.uint64(idx2 * 4)
+                value1 = numba.uint64(bb_uint64 >> shift1) & numba.uint64(0xF)
+                value2 = numba.uint64(bb_uint64 >> shift2) & numba.uint64(0xF)
                 if value1 != 0 and value1 == value2:
                     return True
 

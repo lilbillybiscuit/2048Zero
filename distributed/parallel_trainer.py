@@ -30,8 +30,13 @@ class ParallelZeroTrainer:
         project_name: str = "2048-zero-parallel",
         experiment_name: Optional[str] = None,
         num_workers: int = None,  # Default to CPU count
+        workers_per_gpu: int = 3,  # Default workers per GPU (if GPUs available)
         seed: int = 42,
-        reward_function = None  # Custom reward function
+        reward_function = None,  # Custom reward function
+        dirichlet_eps: float = 0.25, # Exploration noise weight
+        dirichlet_alpha: float = 0.5, # Dirichlet concentration parameter
+        temperature: float = 1.0, # Action selection temperature
+        use_compile: bool = False  # Whether to use torch.compile for speedup
     ):
         """
         Initialize the trainer with model, rules and parallel settings
@@ -43,20 +48,62 @@ class ParallelZeroTrainer:
             project_name: Project name for wandb
             experiment_name: Experiment name for wandb
             num_workers: Number of worker processes for parallel self-play
+            workers_per_gpu: Maximum workers to assign per GPU to prevent overload
             seed: Random seed for initialization
             reward_function: Custom function to calculate reward value with signature:
                             reward_function(state, game_stats) -> (reward_value, reward_name)
+            dirichlet_eps: Weight of Dirichlet noise added to root node (exploration)
+            dirichlet_alpha: Concentration parameter for Dirichlet noise 
+            temperature: Temperature parameter for action selection
+            use_compile: Whether to use torch.compile to speed up training
         """
         self.model = model
         self.rules = rules
         self.seed = seed
         self.reward_function = reward_function
+        self.dirichlet_eps = dirichlet_eps
+        self.dirichlet_alpha = dirichlet_alpha
+        self.temperature = temperature
+        self.use_compile = use_compile
         
         # Set the random seed for reproducibility
         seed_everything(seed)
         
         # Set up device manager first to get GPU count
         self.device_manager = DeviceManager()
+        
+        # Set up training device and move model there once
+        self.train_device = self.device_manager.get_best_device()
+        print(f"Using {self.train_device} for model training")
+        
+        # Move model to training device with anti-deadlock protections
+        if self.train_device.startswith('cuda'):
+            try:
+                # Simple initialization without complex operations
+                device_idx = int(self.train_device.split(':')[1]) if ':' in self.train_device else 0
+                torch.cuda.set_device(device_idx)
+                
+                # Move model with timeout protection
+                from .cuda_utils import cuda_operation_timeout
+                with cuda_operation_timeout(seconds=30):
+                    self.model.to(self.train_device)
+            except Exception as e:
+                # If anything fails, fail immediately - no retries
+                raise RuntimeError(f"CUDA error during model transfer: {e}")
+        else:
+            self.model.to(self.train_device)
+        
+        # Apply torch.compile if requested and available
+        # Check for PyTorch version 2.0+ which supports compile
+        if self.use_compile:
+            try:
+                if hasattr(torch, 'compile'):
+                    print(f"Using torch.compile to optimize model")
+                    self.model = torch.compile(self.model, mode="reduce-overhead")
+                else:
+                    print(f"torch.compile not available in this PyTorch version, skipping optimization")
+            except Exception as e:
+                print(f"Warning: torch.compile failed: {e}, continuing without compilation")
         
         # Set number of workers
         if num_workers is not None:
@@ -66,10 +113,14 @@ class ParallelZeroTrainer:
             # If GPUs are available, automatically round to ensure even distribution
             if self.device_manager.num_gpus > 0:
                 # Calculate workers per GPU and round down to ensure even distribution
-                workers_per_gpu = num_workers // self.device_manager.num_gpus
+                requested_workers_per_gpu = num_workers // self.device_manager.num_gpus
+                
+                # Cap workers per GPU to prevent overload
+                effective_workers_per_gpu = min(workers_per_gpu, requested_workers_per_gpu) 
+                
                 # If workers_per_gpu is at least 1, adjust total count
-                if workers_per_gpu >= 1:
-                    self.num_workers = workers_per_gpu * self.device_manager.num_gpus
+                if effective_workers_per_gpu >= 1:
+                    self.num_workers = effective_workers_per_gpu * self.device_manager.num_gpus
                 else:
                     # If fewer workers than GPUs, use at least one worker per GPU
                     self.num_workers = self.device_manager.num_gpus
@@ -77,7 +128,8 @@ class ParallelZeroTrainer:
                 # Notify if adjustment was made
                 if self.num_workers != original_workers:
                     print(f"Adjusted worker count from {original_workers} to {self.num_workers} "
-                          f"for even distribution across {self.device_manager.num_gpus} GPUs.")
+                          f"for even distribution across {self.device_manager.num_gpus} GPUs "
+                          f"(max {workers_per_gpu} workers per GPU).")
             else:
                 # No GPUs, use specified count
                 self.num_workers = num_workers
@@ -87,9 +139,12 @@ class ParallelZeroTrainer:
             
             # If GPUs are available, ensure worker count is divisible by GPU count
             if self.device_manager.num_gpus > 0:
-                # Calculate workers per GPU and ensure at least 2 per GPU if possible
-                workers_per_gpu = max(2, cpu_count // self.device_manager.num_gpus)
-                self.num_workers = workers_per_gpu * self.device_manager.num_gpus
+                # Calculate workers per GPU and ensure at least 1 per GPU
+                auto_workers_per_gpu = max(1, cpu_count // self.device_manager.num_gpus)
+                # Cap at the specified max workers per GPU
+                effective_workers_per_gpu = min(auto_workers_per_gpu, workers_per_gpu)
+                self.num_workers = effective_workers_per_gpu * self.device_manager.num_gpus
+                print(f"Auto-configured {effective_workers_per_gpu} workers per GPU (max {workers_per_gpu})")
             else:
                 self.num_workers = cpu_count
         
@@ -104,13 +159,13 @@ class ParallelZeroTrainer:
         if experiment_name is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             board_size = f"{rules.height}x{rules.width}"
-            model_size = f"f{model.conv1.out_channels}_b{len(model.blocks)}"
+            model_size = f"f{model.conv1.out_channels}_b{model.blocks}"
             experiment_name = f"zero_parallel_{board_size}_{model_size}_{timestamp}"
             
         # Initialize monitoring
         config = {
             "model_filters": model.conv1.out_channels,
-            "model_blocks": len(model.blocks),
+            "model_blocks": model.blocks,
             "model_k": model.k,
             "board_height": rules.height,
             "board_width": rules.width,
@@ -136,9 +191,25 @@ class ParallelZeroTrainer:
         self.save_model()
     
     def save_model(self):
-        """Save the current model to the shared model path"""
+        """Save the current model to the shared model path with metadata"""
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-        torch.save(self.model.state_dict(), self.model_path)
+        
+        # Save model with metadata to ensure workers can recreate the same architecture
+        state_dict = self.model.state_dict()
+        
+        # Get model architecture parameters
+        if hasattr(self.model, 'filters') and hasattr(self.model, 'blocks'):
+            metadata = {
+                'filters': self.model.filters,
+                'blocks': self.model.blocks,
+                'state_dict': state_dict
+            }
+            torch.save(metadata, self.model_path, pickle_protocol=4)
+            print(f"Saved model with metadata: filters={self.model.filters}, blocks={self.model.blocks}")
+        else:
+            # Fallback for backwards compatibility
+            torch.save(state_dict, self.model_path, pickle_protocol=4)
+            print("Saved model state dict without metadata")
     
     def _collect_selfplay_data_parallel(
         self,
@@ -174,7 +245,11 @@ class ParallelZeroTrainer:
             simulations_per_move=simulations,
             temp_dir=self.temp_dir,
             seed=self.seed,
-            reward_function=self.reward_function
+            reward_function=self.reward_function,
+            dirichlet_eps=self.dirichlet_eps,
+            dirichlet_alpha=self.dirichlet_alpha,
+            temperature=self.temperature,
+            use_compile=self.use_compile
         )
         
         # Generate games in parallel
@@ -201,27 +276,11 @@ class ParallelZeroTrainer:
         Returns:
             Tuple of (average_loss, average_policy_loss, average_value_loss)
         """
+        # Simply set model to training mode, already on correct device from initialization
         self.model.train()
         
-        # Move model to best available device with anti-deadlock protections
-        device = self.device_manager.get_best_device()
-        
-        # Use timeout protection for CUDA devices
-        if device.startswith('cuda'):
-            try:
-                # Simple initialization without complex operations
-                device_idx = int(device.split(':')[1]) if ':' in device else 0
-                torch.cuda.set_device(device_idx)
-                
-                # Don't call any complex CUDA operations before moving model
-                # Just move the model with timeout protection
-                with cuda_operation_timeout(seconds=30):
-                    self.model.to(device)
-            except Exception as e:
-                # If anything fails, fail immediately - no retries
-                raise RuntimeError(f"CUDA error during model transfer: {e}")
-        else:
-            self.model.to(device)
+        # Use our pre-configured train_device
+        device = self.train_device
 
         random.shuffle(samples)
 
@@ -248,9 +307,9 @@ class ParallelZeroTrainer:
             # Stack boards and convert to tensors
             boards_array = np.stack(boards, axis=0)  # Shape: (batch_size, height, width)
 
-            state_tensor = self.model.to_onehot(boards_array).to(device)
-            pi_tensor = torch.tensor(pis, dtype=torch.float32).to(device)
-            z_tensor = torch.tensor(zs, dtype=torch.float32).unsqueeze(1).to(device)
+            state_tensor = self.model.to_onehot(boards_array, device=device)
+            pi_tensor = torch.tensor(pis, dtype=torch.float32, device=device)
+            z_tensor = torch.tensor(zs, dtype=torch.float32, device=device).unsqueeze(1)
 
             optimizer.zero_grad()
 
@@ -363,7 +422,7 @@ class ParallelZeroTrainer:
         self.monitor.run_data.update({
             "model_config": {
                 "filters": self.model.conv1.out_channels,
-                "blocks": len(self.model.blocks),
+                "blocks": self.model.blocks,
                 "k": self.model.k
             },
             "board_config": {

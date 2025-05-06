@@ -9,6 +9,9 @@ import numpy as np
 from typing import Dict, Any, Callable, Optional, Tuple
 from zero.game import GameState
 
+# Global running maximum score for dynamic scaling
+_global_max_score = 50000  # Default starting value
+
 # Module-level reward functions that are pickle-friendly for multiprocessing
 def score_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, str]:
     """
@@ -25,6 +28,29 @@ def score_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, s
     # Normalize score to [-1, 1] range using log scale
     z = min(max((math.log(score + 100) / math.log(50000 + 100)) * 2 - 1, -1.0), 1.0)
     return z, "score"
+
+def dynamic_score_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, str]:
+    """
+    Dynamic score-based reward function that adapts to the highest observed score
+    
+    Args:
+        state: Final game state
+        stats: Game statistics dictionary
+        
+    Returns:
+        tuple: (reward_value, reward_name)
+    """
+    global _global_max_score
+    score = stats['score']
+    
+    # Update the global maximum score if this score is higher
+    if score > _global_max_score:
+        # Use a smoothing factor to avoid sudden large changes
+        _global_max_score = max(score, _global_max_score * 0.9 + score * 0.1)
+    
+    # Normalize score to [-1, 1] range using log scale with dynamic maximum
+    z = min(max((math.log(score + 100) / math.log(_global_max_score + 100)) * 2 - 1, -1.0), 1.0)
+    return z, "dynamic_score"
 
 def max_tile_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, str]:
     """
@@ -68,6 +94,9 @@ def hybrid_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, 
 
 # Default reward function for parallel training
 default_reward_func = score_reward_func
+
+# Dynamic reward function for adaptive scaling
+dynamic_reward_func = dynamic_score_reward_func
 
 # Object-oriented reward class implementations
 class RewardFunction:
@@ -174,6 +203,50 @@ class ScoreReward(RewardFunction):
     def to_func(self) -> Callable[[GameState, Dict[str, Any]], Tuple[float, str]]:
         """Convert to function format for multiprocessing"""
         return score_reward_func
+        
+        
+class DynamicScoreReward(RewardFunction):
+    """Reward based on score with dynamic maximum value scaling"""
+    
+    def __init__(self, initial_max_score: int = 50000):
+        """Initialize dynamic score-based reward
+        
+        Args:
+            initial_max_score: Initial maximum score for normalization
+        """
+        super().__init__("dynamic_score")
+        self.initial_max_score = initial_max_score
+        # Set the global max score to the initial value if not already higher
+        global _global_max_score
+        _global_max_score = max(_global_max_score, initial_max_score)
+    
+    def __call__(self, game_stats: Dict[str, Any]) -> float:
+        """Calculate reward based on score with dynamic scaling
+        
+        Args:
+            game_stats: Game statistics
+            
+        Returns:
+            float: Normalized reward in range [-1, 1]
+        """
+        global _global_max_score
+        score = game_stats['score']
+        
+        # Update the global maximum score if this score is higher
+        if score > _global_max_score:
+            # Use a smoothing factor to avoid sudden large changes
+            _global_max_score = max(score, _global_max_score * 0.9 + score * 0.1)
+        
+        # Normalize score to [-1, 1] range using log scale with dynamic maximum
+        normalized = math.log(score + 100) / math.log(_global_max_score + 100) * 2 - 1
+        return min(max(normalized, -1.0), 1.0)  # Clamp to [-1, 1]
+    
+    def get_key_metric(self) -> str:
+        return "score"
+    
+    def to_func(self) -> Callable[[GameState, Dict[str, Any]], Tuple[float, str]]:
+        """Convert to function format for multiprocessing"""
+        return dynamic_score_reward_func
 
 
 class HybridReward(RewardFunction):
@@ -228,7 +301,7 @@ def get_reward_function(reward_type: str = "score", **kwargs) -> RewardFunction:
     """Get reward function by type
     
     Args:
-        reward_type: Type of reward function ('score', 'max_tile', or 'hybrid')
+        reward_type: Type of reward function ('score', 'max_tile', 'dynamic_score', or 'hybrid')
         **kwargs: Additional arguments for the reward function
         
     Returns:
@@ -237,6 +310,9 @@ def get_reward_function(reward_type: str = "score", **kwargs) -> RewardFunction:
     if reward_type == "score":
         max_score = kwargs.get("max_score", 50000)
         return ScoreReward(max_score=max_score)
+    elif reward_type == "dynamic_score":
+        initial_max_score = kwargs.get("initial_max_score", 50000)
+        return DynamicScoreReward(initial_max_score=initial_max_score)
     elif reward_type == "max_tile":
         return MaxTileReward()
     elif reward_type == "hybrid":
@@ -244,10 +320,15 @@ def get_reward_function(reward_type: str = "score", **kwargs) -> RewardFunction:
         reward_functions = {}
         weights = {}
         
-        # Score component
+        # Score component (static or dynamic)
+        use_dynamic = kwargs.get("use_dynamic_score", False)
         if "score_weight" in kwargs and kwargs["score_weight"] > 0:
-            max_score = kwargs.get("max_score", 50000)
-            reward_functions["score"] = ScoreReward(max_score=max_score)
+            if use_dynamic:
+                initial_max_score = kwargs.get("initial_max_score", 50000)
+                reward_functions["score"] = DynamicScoreReward(initial_max_score=initial_max_score)
+            else:
+                max_score = kwargs.get("max_score", 50000)
+                reward_functions["score"] = ScoreReward(max_score=max_score)
             weights["score"] = kwargs["score_weight"]
         
         # Max tile component
@@ -268,13 +349,15 @@ def get_reward_func(reward_type: str = "score") -> Callable[[GameState, Dict[str
     Get a multiprocessing-compatible reward function by type
     
     Args:
-        reward_type: Type of reward function ('score', 'max_tile', or 'hybrid')
+        reward_type: Type of reward function ('score', 'dynamic_score', 'max_tile', or 'hybrid')
         
     Returns:
         Function with signature (state, stats) -> (reward_value, reward_name)
     """
     if reward_type == "score":
         return score_reward_func
+    elif reward_type == "dynamic_score":
+        return dynamic_score_reward_func
     elif reward_type == "max_tile":
         return max_tile_reward_func
     elif reward_type == "hybrid":
