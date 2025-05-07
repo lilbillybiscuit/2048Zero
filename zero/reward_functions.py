@@ -25,9 +25,9 @@ def score_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, s
         tuple: (reward_value, reward_name)
     """
     score = stats['score']
-    # Normalize score to [-1, 1] range using log scale
-    z = min(max((math.log(score + 100) / math.log(50000 + 100)) * 2 - 1, -1.0), 1.0)
-    return z, "score"
+    # Use raw log score without normalization to [-1,1]
+    z = math.log(score + 100)
+    return z, "unbounded_score"
 
 def dynamic_score_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, str]:
     """
@@ -48,9 +48,9 @@ def dynamic_score_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[
         # Use a smoothing factor to avoid sudden large changes
         _global_max_score = max(score, _global_max_score * 0.9 + score * 0.1)
     
-    # Normalize score to [-1, 1] range using log scale with dynamic maximum
-    z = min(max((math.log(score + 100) / math.log(_global_max_score + 100)) * 2 - 1, -1.0), 1.0)
-    return z, "dynamic_score"
+    # Use raw log score without normalization to [-1,1]
+    z = math.log(score + 100)
+    return z, "unbounded_dynamic_score"
 
 def max_tile_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, str]:
     """
@@ -64,9 +64,9 @@ def max_tile_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float
         tuple: (reward_value, reward_name)
     """
     max_tile = stats['max_tile']
-    # Scale based on log2 of max tile / 11 (11 = log2(2048))
-    z = math.log2(int(max_tile) + 1) / 11.0 * 2 - 1
-    return z, "max_tile"
+    # Use log2 of max tile directly without normalization
+    z = math.log2(int(max_tile) + 1)
+    return z, "unbounded_max_tile"
 
 def hybrid_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, str]:
     """
@@ -92,7 +92,7 @@ def hybrid_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, 
     
     return z, "hybrid"
 
-# Default reward function for parallel training
+# Default reward function for parallel training (now using unbounded rewards)
 default_reward_func = score_reward_func
 
 # Dynamic reward function for adaptive scaling

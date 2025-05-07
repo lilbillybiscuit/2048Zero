@@ -172,7 +172,7 @@ class ZeroNetworkMini(ZeroNetworkMain):
         policy_out = self.softmax(policy_logits)
 
         value_out = self.value_linear(merged)
-        value_out = self.tanh(value_out)
+        # value_out = self.tanh(value_out)
 
         return policy_out, value_out
 

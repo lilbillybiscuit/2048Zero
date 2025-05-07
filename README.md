@@ -28,6 +28,33 @@ python run_server.py --host 0.0.0.0 --port 8000 --auth-token YOUR_TOKEN --localh
 python run_server.py --reset --localhost --initial-deadline 5 --training-deadline 5
 ```
 
+### Resuming Training
+
+You can resume training from a checkpoint:
+
+```bash
+# Resume from a local checkpoint file
+python train.py --resume --resume-from=checkpoints/zero_4x4_f128_b10_20240507_epoch_10.pth
+
+# Resume from a URL
+python train.py --resume --resume-from=https://example.com/checkpoints/model_epoch_10.pth
+
+# Resume from R2 storage (requires R2 credentials in environment variables)
+python train.py --resume --resume-from=r2://bucket-name/checkpoints/model_epoch_10.pth
+```
+
+For R2 URLs, you need to set these environment variables:
+```bash
+export R2_ACCESS_KEY=your_access_key
+export R2_SECRET_KEY=your_secret_key
+export R2_ENDPOINT=https://account-id.r2.cloudflarestorage.com
+```
+
+You can also use the helper script to download checkpoints:
+```bash
+python r2_checkpoint.py r2://bucket-name/path/to/checkpoint.pth
+```
+
 Server configuration:
 - `--localhost`: Serve weights directly from the server instead of using R2
 - `--reset`: Reset all state (clear WAL and snapshots) for a fresh start

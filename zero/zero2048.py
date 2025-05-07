@@ -430,9 +430,9 @@ class ZeroTrainer:
             def default_score_reward(state, stats):
                 """Default score-based reward"""
                 score = stats['score']
-                # Normalize score to [-1, 1] range using log scale
-                z = min(max((math.log(score + 100) / math.log(50000 + 100)) * 2 - 1, -1.0), 1.0)
-                return z, "score"
+                # Use raw log score without normalization to [-1,1]
+                z = math.log(score + 100)
+                return z, "unbounded_score"
             
             # Use provided reward function or default to score reward
             if self.reward_function:
@@ -524,31 +524,132 @@ class ZeroTrainer:
             state_tensor = self.model.to_onehot(boards_array, device=device)
             pi_tensor = torch.tensor(pis, dtype=torch.float32, device=device)
             z_tensor = torch.tensor(zs, dtype=torch.float32, device=device).unsqueeze(1)
+            
+            # Periodically check policy target distribution (do this rarely to avoid slowing training)
+            if epoch > 0 and epoch % 10 == 0 and i == 0:
+                # Calculate average policy entropy to check if targets are too deterministic
+                target_entropy = -(pi_tensor * torch.log(pi_tensor + 1e-8)).sum(dim=1).mean().item()
+                print(f"\nEpoch {epoch} policy target statistics:")
+                print(f"  Average policy entropy: {target_entropy:.4f}")
+                
+                # Count how many samples have a highly dominant action (>0.9 probability)
+                dominant = torch.max(pi_tensor, dim=1)[0] > 0.9
+                dominant_pct = dominant.float().mean().item() * 100
+                print(f"  Samples with dominant action (>0.9): {dominant_pct:.1f}%")
+                
+                # Calculate action distribution across batch
+                action_counts = torch.argmax(pi_tensor, dim=1).unique(return_counts=True)[1]
+                total = action_counts.sum().item()
+                action_freq = action_counts.float() / total
+                print(f"  Action distribution: {action_freq.cpu().numpy().round(2)}")
+                
+                # Calculate how often the most common move is selected
+                most_common_pct = action_counts.max().item() / total * 100
+                print(f"  Most common move: {most_common_pct:.1f}% of samples")
 
             optimizer.zero_grad()
 
             p_pred, v_pred = self.model(state_tensor)
-
-            policy_loss = -(pi_tensor * torch.log(p_pred + 1e-8)).sum(dim=1).mean()
-            value_loss = torch.nn.functional.mse_loss(v_pred, z_tensor)
-            loss = policy_loss + value_loss
+            
+            # Diagnostic: Save policy targets and predictions for first batch of first epoch
+            if i == 0 and epoch == 0:
+                # Print policy distributions for the first few samples
+                print("\nDiagnostic - Policy target/prediction distributions:")
+                for idx in range(min(5, batch_size_actual)):
+                    print(f"Sample {idx}:")
+                    print(f"  Target: {pi_tensor[idx].cpu().numpy().round(3)}")
+                    print(f"  Predicted: {p_pred[idx].detach().cpu().numpy().round(3)}")
+                    print(f"  Entropy (target): {-(pi_tensor[idx] * torch.log(pi_tensor[idx] + 1e-8)).sum().item():.4f}")
+                    print(f"  Entropy (pred): {-(p_pred[idx] * torch.log(p_pred[idx] + 1e-8)).sum().item():.4f}")
+                
+                # Calculate theoretical minimum loss for these targets
+                uniform_pred = torch.ones_like(p_pred) / 4.0  # Uniform distribution across 4 actions
+                theoretical_min = -(pi_tensor * torch.log(uniform_pred + 1e-8)).sum(dim=1).mean().item()
+                print(f"Theoretical minimum cross-entropy with uniform prediction: {theoretical_min:.4f}")
+                
+                # Check if policy targets are all similar (might indicate MCTS exploration issue)
+                target_sim = torch.mean(torch.std(pi_tensor, dim=0)).item()
+                print(f"Policy target diversity (stdev across batch): {target_sim:.4f}")
+                
+                # Print action statistics
+                action_probs = torch.mean(pi_tensor, dim=0).cpu().numpy()
+                print(f"Average action probabilities in batch: {action_probs.round(3)}")
+            
+            # Calculate individual sample losses for debugging
+            sample_losses = -(pi_tensor * torch.log(p_pred + 1e-8)).sum(dim=1)
+            
+            # Regular cross-entropy loss
+            policy_loss = sample_losses.mean()
+            
+            # Use Huber/Smooth L1 loss for value prediction with unbounded rewards
+            value_loss = torch.nn.functional.smooth_l1_loss(v_pred, z_tensor)
+            # Scale value loss down to balance with policy loss
+            value_loss_weight = 0.05
+            loss = policy_loss + value_loss_weight * value_loss
+            
+            # Diagnostic: If policy loss is suspiciously constant
+            if i == 0 and epoch > 0 and epoch % 5 == 0:
+                # Check gradient flow
+                params_with_grad = sum(p.requires_grad for p in self.model.parameters())
+                policy_params = sum(1 for name, p in self.model.named_parameters() if 'policy' in name and p.requires_grad)
+                print(f"\nGradient flow check at epoch {epoch}:")
+                print(f"  Parameters requiring gradients: {params_with_grad}")
+                print(f"  Policy head parameters: {policy_params}")
+                print(f"  Sample policy losses: {sample_losses[:5].detach().cpu().numpy().round(3)}")
+                print(f"  Value target range: [{z_tensor.min().item():.2f}, {z_tensor.max().item():.2f}]")
             
             # Backward pass
             loss.backward()
             
-            # Update weights
-            optimizer.step()
+            # Check for NaN gradients
+            has_nan = False
+            for name, param in self.model.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    has_nan = True
+                    print(f"Warning: NaN gradient in {name}")
+            
+            # Check policy gradient flow every 5 epochs in the first batch
+            if i == 0 and epoch % 5 == 0:
+                gradients = []
+                policy_gradients = []
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        gradients.append(grad_norm)
+                        if 'policy' in name:
+                            policy_gradients.append((name, grad_norm))
+                
+                if gradients:
+                    avg_grad = sum(gradients) / len(gradients)
+                    max_grad = max(gradients)
+                    print(f"Gradient stats - Avg: {avg_grad:.6f}, Max: {max_grad:.6f}")
+                    
+                    if policy_gradients:
+                        print("Policy gradients:")
+                        for name, norm in policy_gradients:
+                            print(f"  {name}: {norm:.6f}")
+            
+            # Gradient clipping to prevent exploding gradients with unbounded values
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            # Skip updates if we have NaN gradients
+            if not has_nan:
+                # Update weights
+                optimizer.step()
+            else:
+                print("Skipping parameter update due to NaN gradients")
             
             # Accumulate losses
             batch_size_actual = end_idx - start_idx
             total_loss += loss.item() * batch_size_actual
             total_policy_loss += policy_loss.item() * batch_size_actual
-            total_value_loss += value_loss.item() * batch_size_actual
+            # Use the actual weighted value loss for reporting consistency
+            total_value_loss += (value_loss_weight * value_loss.item()) * batch_size_actual
             
             # Update progress bar
             current_loss = loss.item()
             current_policy_loss = policy_loss.item()
-            current_value_loss = value_loss.item()
+            current_value_loss = value_loss_weight * value_loss.item()
             batch_pbar.set_postfix({
                 'loss': f'{current_loss:.4f}',
                 'π_loss': f'{current_policy_loss:.4f}',
@@ -574,7 +675,7 @@ class ZeroTrainer:
     
     def train(self, epochs: int = 100, games_per_epoch: int = 32, batch_size: int = 64, 
              lr: float = 0.001, log_interval: int = 1, checkpoint_interval: int = 10, 
-             resume: bool = False, **kwargs):
+             resume: bool = False, resume_from: str = None, **kwargs):
         """Train the model using self-play for the specified number of epochs
         
         Args:
@@ -585,6 +686,7 @@ class ZeroTrainer:
             log_interval: How often to log detailed metrics (every N epochs)
             checkpoint_interval: How often to save model checkpoints (every N epochs)
             resume: Whether to resume training from previous state
+            resume_from: Path to checkpoint file to resume from (can be local file or URL)
             **kwargs: Additional arguments including wandb config overrides
         """
         # Create checkpoint directory if it doesn't exist
@@ -609,11 +711,171 @@ class ZeroTrainer:
         if self.monitor.use_wandb and not self.monitor.wandb_initialized:
             self.monitor.init_wandb(watch_model=self.model)
         
+        # Handle resuming from checkpoint
+        start_epoch = 0
+        if resume and resume_from:
+            print(f"Resuming training from checkpoint: {resume_from}")
+            
+            # Handle remote URLs (use helper script if needed)
+            if resume_from.startswith(("http://", "https://", "r2://")):
+                print(f"Remote checkpoint specified: {resume_from}")
+                try:
+                    # If it's an R2 URL, use the r2_checkpoint.py script to download it
+                    if resume_from.startswith("r2://"):
+                        import subprocess
+                        cmd = [sys.executable, "r2_checkpoint.py", resume_from]
+                        print(f"Running: {' '.join(cmd)}")
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                        
+                        if result.returncode != 0:
+                            print(f"Error downloading from R2: {result.stderr}")
+                        else:
+                            # Extract the local path from the output
+                            output_lines = result.stdout.strip().split("\n")
+                            for line in output_lines:
+                                if line.startswith("Checkpoint downloaded to:"):
+                                    resume_from = line.split(":", 1)[1].strip()
+                                    break
+                    
+                    # If it's a direct HTTP URL, download it manually
+                    elif resume_from.startswith(("http://", "https://")):
+                        import requests
+                        
+                        # Make sure checkpoints directory exists
+                        os.makedirs("checkpoints", exist_ok=True)
+                        
+                        # Get filename from URL
+                        local_path = os.path.join("checkpoints", resume_from.split("/")[-1])
+                        
+                        # Download the file
+                        print(f"Downloading checkpoint from {resume_from} to {local_path}")
+                        response = requests.get(resume_from, timeout=60)
+                        response.raise_for_status()
+                        
+                        with open(local_path, "wb") as f:
+                            f.write(response.content)
+                            
+                        print(f"Successfully downloaded checkpoint to {local_path}")
+                        resume_from = local_path
+                        
+                        # Try to download the run file too
+                        try:
+                            run_url = resume_from.replace(".pth", "_run.json")
+                            run_path = os.path.join("checkpoints", run_url.split("/")[-1])
+                            
+                            run_response = requests.get(run_url, timeout=10)
+                            if run_response.status_code == 200:
+                                with open(run_path, "wb") as f:
+                                    f.write(run_response.content)
+                                print(f"Also downloaded run data to {run_path}")
+                        except Exception as e:
+                            print(f"Note: Could not download run data: {e}")
+                            
+                except Exception as e:
+                    print(f"Error downloading checkpoint: {e}")
+                    print("Starting with a fresh model instead")
+            
+            # Now load the checkpoint if available
+            if os.path.exists(resume_from):
+                # Try to determine the epoch from filename
+                checkpoint_file = os.path.basename(resume_from)
+                if "_epoch_" in checkpoint_file:
+                    try:
+                        start_epoch = int(checkpoint_file.split("_epoch_")[1].split(".")[0]) + 1
+                    except:
+                        print("Could not determine epoch from filename, starting from 0")
+                
+                # Load model weights
+                print(f"Loading model weights from {resume_from}")
+                state_dict = torch.load(resume_from, map_location='cpu')
+                self.model.load_state_dict(state_dict)
+                print(f"Successfully loaded model from checkpoint. Resuming from epoch {start_epoch}")
+                
+                # Try to load run data too
+                run_file = resume_from.replace(".pth", "_run.json")
+                if os.path.exists(run_file):
+                    try:
+                        with open(run_file, 'r') as f:
+                            run_data = json.load(f)
+                            self.monitor.run_data = run_data
+                        print(f"Successfully loaded run data from {run_file}")
+                    except Exception as e:
+                        print(f"Error loading run data: {e}")
+            else:
+                print(f"Warning: Checkpoint file {resume_from} not found. Starting fresh.")
+                # Create checkpoints directory if it doesn't exist
+                os.makedirs("checkpoints", exist_ok=True)
+
+                # Download the checkpoint
+                response = requests.get(resume_from, timeout=60)
+                response.raise_for_status()
+
+                # Extract filename from URL or use a default
+                if "/" in resume_from:
+                    local_path = os.path.join("checkpoints", resume_from.split("/")[-1])
+                else:
+                    local_path = os.path.join("checkpoints", "downloaded_checkpoint.pth")
+
+                # Save the checkpoint
+                with open(local_path, 'wb') as f:
+                    f.write(response.content)
+
+                print(f"Successfully downloaded checkpoint to {local_path}")
+                resume_from = local_path
+
+                # Also try to download the run file
+                run_url = resume_from.replace(".pth", "_run.json").replace("_epoch_", "_run")
+                try:
+                    run_response = requests.get(run_url, timeout=30)
+                    run_response.raise_for_status()
+
+                    local_run_path = local_path.replace(".pth", "_run.json").replace("_epoch_", "_run")
+                    with open(local_run_path, 'wb') as f:
+                        f.write(run_response.content)
+
+                    print(f"Successfully downloaded run data to {local_run_path}")
+                except Exception as e:
+                    print(f"Note: Could not download run data: {e}")
+
+            # Now try to load the local checkpoint
+            if os.path.exists(resume_from):
+                # Extract epoch number from filename
+                checkpoint_file = os.path.basename(resume_from)
+                if "_epoch_" in checkpoint_file:
+                    try:
+                        start_epoch = int(checkpoint_file.split("_epoch_")[1].split(".")[0]) + 1
+                    except:
+                        print("Could not determine epoch from filename, starting from 0")
+                
+                # Load model weights
+                state_dict = torch.load(resume_from, map_location='cpu')
+                self.model.load_state_dict(state_dict)
+                print(f"Successfully loaded model from checkpoint. Resuming from epoch {start_epoch}")
+                
+                # Also try to load run data
+                run_file = resume_from.replace(".pth", "_run.json").replace("_epoch_", "_run")
+                if os.path.exists(run_file):
+                    import json
+                    try:
+                        with open(run_file, 'r') as f:
+                            self.monitor.run_data = json.load(f)
+                        print(f"Successfully loaded run data from {run_file}")
+                    except Exception as e:
+                        print(f"Error loading run data: {e}")
+            else:
+                print(f"Warning: Checkpoint file {resume_from} not found. Starting fresh.")
+        
         # Initialize optimizer with specified learning rate
         optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
         
         # Optional: Add learning rate scheduler for better convergence
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+        
+        # If resuming, adjust scheduler
+        if resume and start_epoch > 0:
+            for _ in range(start_epoch):
+                scheduler.step()
+            print(f"Adjusted learning rate for resumed training: {scheduler.get_last_lr()[0]}")
         
         # Create a run tracker file to allow resume
         self.monitor.run_data.update({
@@ -630,12 +892,15 @@ class ZeroTrainer:
                 "epochs": epochs,
                 "games_per_epoch": games_per_epoch,
                 "batch_size": batch_size,
-                "lr": lr
+                "lr": lr,
+                "resume": resume,
+                "resume_from": resume_from,
+                "start_epoch": start_epoch
             }
         })
         
         # Training loop
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             epoch_start_time = time.time()
             
             # Set model to evaluation mode during self-play
@@ -643,6 +908,22 @@ class ZeroTrainer:
             
             # 1. Collect training data with self-play
             print(f"Epoch {epoch+1}/{epochs}: Collecting self-play data...")
+            
+            # Configure exploration parameters for self-play
+            # Use higher exploration in early epochs, then decrease gradually
+            exploration_factor = max(0.5, 1.0 - epoch / (epochs * 0.5))  # Linearly decrease to 0.5 by mid-training
+            dirichlet_eps = kwargs.get('dirichlet_eps', 0.25) * exploration_factor
+            dirichlet_alpha = kwargs.get('dirichlet_alpha', 0.5)
+            temperature = max(0.8, kwargs.get('temperature', 1.0) * exploration_factor)
+            
+            # Print exploration settings for this epoch
+            print(f"Self-play exploration: dir_eps={dirichlet_eps:.2f}, dir_alpha={dirichlet_alpha:.2f}, temp={temperature:.2f}")
+            
+            # Update player parameters
+            self.player.dir_eps = dirichlet_eps
+            self.player.dir_alpha = dirichlet_alpha
+            self.player.temperature = temperature
+            
             samples, epoch_stats = self._collect_selfplay_data(
                 games_per_epoch=games_per_epoch,
                 simulations=kwargs.get('simulations', 50)
