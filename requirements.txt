@@ -1,0 +1,14 @@
+torch>=1.12.0
+numpy>=1.20.0
+fastapi>=0.68.0
+uvicorn>=0.15.0
+pydantic>=1.8.0
+requests>=2.26.0
+zstandard>=0.16.0
+lz4>=4.0.0
+python-multipart>=0.0.5
+pyyaml>=6.0
+wandb>=0.12.0
+tqdm>=4.62.0
+boto3>=1.24.0  # For R2/S3 integration
+pytorch-lightning
