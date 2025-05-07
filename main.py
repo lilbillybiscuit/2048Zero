@@ -28,7 +28,7 @@ def best_of_n(games: int, depth: int):
             best_score, best_seed = score, seed
         print(f"[{i:3d}/{games}] score = {score}")
     print(f"\nBEST score={best_score}  seed={best_seed}\n")
-    ai.play(depth=depth, verbose=True, seed=best_seed)
+    # ai.play(depth=depth, verbose=True, seed=best_seed)
 
 
 def other_task():
