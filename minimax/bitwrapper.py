@@ -5,7 +5,7 @@ Bridges the NumPy‑based Simplified2048 engine with the original
 64‑bit‑nibble “bit‑board” representation used by the expectimax AI.
 """
 
-from simplified_2048 import Simplified2048
+from .simplified_2048 import Simplified2048
 import numpy as np
 from typing import Tuple
 

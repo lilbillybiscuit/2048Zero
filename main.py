@@ -5,8 +5,7 @@
 """
 
 import argparse, random
-import minimax.ai2048_bitboard as ai          
-
+from minimax import ai2048_bitboard as ai
 # --------------------------------------------------------------------------- #
 # 2048 helpers
 # --------------------------------------------------------------------------- #

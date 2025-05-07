@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from bitwrapper import BitBoardEnv          
+from .bitwrapper import BitBoardEnv          
 import math, random
 from functools import lru_cache
 
