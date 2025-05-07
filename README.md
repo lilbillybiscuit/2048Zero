@@ -122,9 +122,9 @@ Workers will:
 
 This project also includes a minmax implementation for 2048.
 
->[!NOTE]
->currently support 4x4 grid
-
 ```bash
-python minimax/test_minmax.py
+# multiple games
+python main.py 2048-best --games <N>
+# single game
+python main.py 2048
 ```
