@@ -26,11 +26,16 @@ python run_server.py --host 0.0.0.0 --port 8000 --auth-token YOUR_TOKEN --localh
 
 # Reset all state and use shorter deadlines for faster iterations (great for testing)
 python run_server.py --reset --localhost --initial-deadline 5 --training-deadline 5
+
+# Resume training from a checkpoint
+python run_server.py --resume --resume-from=weights/r5.pt
 ```
 
 ### Resuming Training
 
-You can resume training from a checkpoint:
+#### Standalone Trainer
+
+You can resume training with the standalone trainer:
 
 ```bash
 # Resume from a local checkpoint file
@@ -41,6 +46,24 @@ python train.py --resume --resume-from=https://example.com/checkpoints/model_epo
 
 # Resume from R2 storage (requires R2 credentials in environment variables)
 python train.py --resume --resume-from=r2://bucket-name/checkpoints/model_epoch_10.pth
+```
+
+#### Distributed Server
+
+You can also resume training with the distributed server:
+
+```bash
+# Resume from a local checkpoint file
+python run_server.py --resume --resume-from=weights/r5.pt
+
+# Resume from a URL
+python run_server.py --resume --resume-from=https://example.com/checkpoints/model.pt
+
+# Resume from R2 storage (requires R2 credentials)
+python run_server.py --resume --resume-from=r2://bucket-name/weights/model.pt
+
+# Resume with a specific revision number (otherwise auto-detected from filename)
+python run_server.py --resume --resume-from=weights/custom_checkpoint.pt --resume-revision=10
 ```
 
 For R2 URLs, you need to set these environment variables:

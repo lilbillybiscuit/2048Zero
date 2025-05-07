@@ -202,6 +202,10 @@ def process_and_train(batch_data, current_model, config):
 
 def initialize_model(config):
     """Initialize model from scratch or checkpoint"""
+    import torch
+    import os
+    import sys
+    import re
     from zero.game import GameRules
     from zero.zeromodel import ZeroNetwork
     global storage_adapter
@@ -214,7 +218,7 @@ def initialize_model(config):
     # Create rules to get board dimensions
     rules = GameRules()
     
-    # Create model
+    # Create model architecture
     model = ZeroNetwork(
         rules.height,
         rules.width,
@@ -223,28 +227,125 @@ def initialize_model(config):
         blocks=blocks
     )
     
+    # Check if we're resuming from a checkpoint
+    starting_revision = 0
+    if config.get("resume", False) and config.get("resume_from"):
+        resume_path = config.get("resume_from")
+        logger.info(f"Attempting to resume from checkpoint: {resume_path}")
+        
+        # Handle R2 URLs if needed
+        if resume_path.startswith("r2://"):
+            try:
+                # Import checkpoint utility for R2 download
+                sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+                import checkpoint_utils
+                
+                logger.info(f"Downloading checkpoint from R2: {resume_path}")
+                local_path = checkpoint_utils.download_checkpoint_from_r2(resume_path)
+                
+                if local_path:
+                    resume_path = local_path
+                    logger.info(f"Successfully downloaded to: {resume_path}")
+                else:
+                    logger.error("Failed to download checkpoint from R2. Starting fresh.")
+                    config["resume"] = False
+            except ImportError:
+                logger.error("checkpoint_utils module not available, cannot download from R2")
+                logger.error("Make sure boto3 is installed (pip install boto3)")
+                config["resume"] = False
+        
+        # Handle HTTP URLs if needed
+        elif resume_path.startswith(("http://", "https://")):
+            try:
+                # Import checkpoint utility for HTTP download
+                sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+                import checkpoint_utils
+                
+                logger.info(f"Downloading checkpoint from URL: {resume_path}")
+                local_path = checkpoint_utils.download_checkpoint(resume_path)
+                
+                if local_path:
+                    resume_path = local_path
+                    logger.info(f"Successfully downloaded to: {resume_path}")
+                else:
+                    logger.error("Failed to download checkpoint from URL. Starting fresh.")
+                    config["resume"] = False
+            except Exception as e:
+                logger.error(f"Error downloading checkpoint: {e}")
+                config["resume"] = False
+        
+        # Make sure we can access the checkpoint file
+        if config.get("resume", False) and not os.path.exists(resume_path):
+            logger.error(f"Checkpoint file does not exist: {resume_path}")
+            config["resume"] = False
+        
+        # Load the checkpoint if we have a valid file
+        if config.get("resume", False):
+            try:
+                # Determine the revision number to start from
+                revision = config.get("resume_revision")
+                if revision is None:
+                    # Try to extract revision from the filename
+                    match = re.search(r'r(\d+)\.pt$', resume_path)$', resume_path)
+                    if match:
+                        revision = int(match.group(1))
+                        logger.info(f"Extracted revision {revision} from filename")
+                    else:
+                        # Get the highest existing revision number and increment by 1
+                        weights_dir = config.get("weights_dir", "weights")
+                        if os.path.exists(weights_dir):
+                            revisions = []
+                            for filename in os.listdir(weights_dir):
+                                if filename.startswith("r") and filename.endswith(".pt"):
+                                    try:
+                                        rev = int(filename[1:-3])
+                                        revisions.append(rev)
+                                    except ValueError:
+                                        continue
+                            revision = max(revisions) + 1 if revisions else 0
+                
+                # Set starting revision
+                starting_revision = revision
+                logger.info(f"Loading checkpoint and starting from revision {starting_revision}")
+                
+                # Load the model state
+                device = config.get("device", "cpu")
+                if device is None or device == "auto":
+                    device = "cpu"  # Default to CPU for loading
+                
+                # Load weights with appropriate device mapping
+                state_dict = torch.load(resume_path, map_location=device)
+                model.load_state_dict(state_dict)
+                logger.info(f"Successfully loaded model weights from {resume_path}")
+                
+            except Exception as e:
+                logger.error(f"Error loading checkpoint: {e}")
+                logger.error("Creating fresh model instead")
+                starting_revision = 0
+                config["resume"] = False
+    
     # Make sure storage adapter is initialized
     if storage_adapter is None:
         logger.error("Storage adapter not initialized before model initialization!")
         raise RuntimeError("Storage adapter must be initialized before model")
     
     # Save initial model using the storage adapter
-    logger.info("Saving initial model (revision 0)")
-    weights_path, weights_url, weights_sha256 = storage_adapter.save_model(model, 0)
+    logger.info(f"Saving model (revision {starting_revision})")
+    weights_path, weights_url, weights_sha256 = storage_adapter.save_model(model, starting_revision)
     
     # Update shared state
-    shared_state.update_model(0, weights_path, weights_url, weights_sha256)
+    shared_state.update_model(starting_revision, weights_path, weights_url, weights_sha256)
     
-    logger.info(f"Initialized model: revision=0, path={weights_path}, url={weights_url}")
-    return model
+    logger.info(f"Initialized model: revision={starting_revision}, path={weights_path}, url={weights_url}")
+    return model, starting_revision
 
 def main_training_loop(config):
     """Main training loop"""
     logger.info("Starting main training loop")
     
-    # Initialize model
-    current_model = initialize_model(config)
-    current_revision = 0
+    # Initialize model - now returns both model and starting revision
+    current_model, current_revision = initialize_model(config)
+    logger.info(f"Starting training loop with revision {current_revision}")
     
     # Main loop
     while True:

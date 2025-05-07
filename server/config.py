@@ -61,6 +61,11 @@ def parse_args() -> Dict[str, Any]:
 
     # Other settings
     parser.add_argument("--reset", action="store_true", help="Reset all state")
+    
+    # Resume settings
+    parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint")
+    parser.add_argument("--resume-from", type=str, help="Path or URL to checkpoint file")
+    parser.add_argument("--resume-revision", type=int, help="Revision number to resume from (default: auto-detect from filename)")
 
     args = parser.parse_args()
 
@@ -120,7 +125,13 @@ def parse_args() -> Dict[str, Any]:
         # Heartbeat settings
         "heartbeat": 5,
 
-        "reset": args.reset
+        # State settings
+        "reset": args.reset,
+        
+        # Resume settings
+        "resume": args.resume,
+        "resume_from": args.resume_from,
+        "resume_revision": args.resume_revision
     }
 
     return config
