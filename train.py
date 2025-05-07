@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-2048 Zero training script
-"""
+"""2048 Zero training script"""
 import os
 import sys
 import torch
@@ -37,42 +35,8 @@ def main():
     
     args = parser.parse_args()
     
-    # TEMPORARILY DISABLED: Checkpoint resuming code
-    # For now, we'll force these values to start fresh
     args.resume = False
     args.resume_from = None
-    
-    """
-    # Handle R2 URLs for checkpoint resuming - DISABLED
-    if args.resume and args.resume_from:
-        # Only handle R2 URLs, no need for HTTP URLs
-        if args.resume_from.startswith("r2://"):
-            try:
-                # Try to import checkpoint_utils
-                sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-                import checkpoint_utils
-                print(f"Downloading checkpoint from R2: {args.resume_from}")
-                local_path = checkpoint_utils.download_checkpoint_from_r2(args.resume_from)
-                if local_path:
-                    args.resume_from = local_path
-                    print(f"Using downloaded checkpoint: {local_path}")
-                else:
-                    print("WARNING: Could not download checkpoint from R2, starting fresh")
-                    args.resume = False
-                    args.resume_from = None
-            except ImportError:
-                print("WARNING: checkpoint_utils module not available, cannot download from R2")
-                print("Make sure checkpoint_utils.py is in the current directory and boto3 is installed")
-                print("Run: pip install boto3")
-                args.resume = False
-                args.resume_from = None
-        
-        # If checkpoint doesn't exist locally, abort resuming
-        if args.resume and not os.path.exists(args.resume_from):
-            print(f"WARNING: Checkpoint file {args.resume_from} not found. Starting fresh.")
-            args.resume = False
-            args.resume_from = None
-    """
     
     # Initialize game rules, model, and player
     rules = GameRules(num_spawn_tiles_per_move=1)

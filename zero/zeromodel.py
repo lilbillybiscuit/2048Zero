@@ -5,9 +5,7 @@ from typing import List, Tuple, Any, Dict, Optional, Union
 import torch.nn.functional as F
 import numpy as np
 
-# Default device - but don't auto-set it here
-# This causes all workers to try using CUDA
-# Instead, each model instance should set its own device based on constructor parameter
+# Default to CPU, each model instance sets its own device
 default_device = 'cpu'
 
 

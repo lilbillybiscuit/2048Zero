@@ -12,3 +12,6 @@ wandb>=0.12.0
 tqdm>=4.62.0
 boto3>=1.24.0  # For R2/S3 integration
 pytorch-lightning
+numba
+numpy
+tqdm

@@ -5,10 +5,8 @@ class SharedState:
     def __init__(self):
         self.lock = threading.RLock()
 
-        # Training state
         self.is_training = False
 
-        # Model information
         self.revision = 0
         self.weights_path = ""
         self.weights_sha256 = ""
@@ -16,7 +14,7 @@ class SharedState:
 
         self.deadline = datetime.now(timezone.utc) + timedelta(minutes=5)
         self.game_queue = []
-        self.game_ids = set()  # To prevent duplicates
+        self.game_ids = set()
 
         self.config = {}
 
@@ -56,7 +54,6 @@ class SharedState:
                 if game_id:
                     self.game_ids.add(game_id)
 
-            # Add to queue
             self.game_queue.append(batch)
             return True, "Games added to queue"
 
@@ -81,7 +78,6 @@ class SharedState:
             self.weights_path = weights_path
             self.weights_url = weights_url
             self.weights_sha256 = weights_sha256
-            # Set new deadline
             self.deadline = datetime.now(timezone.utc) + timedelta(
                 minutes=self.config.get("training_deadline_minutes", 30))
             return self.revision
