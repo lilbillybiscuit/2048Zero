@@ -11,7 +11,7 @@ You can easily add more sub‑commands (see "other‑task" stub).
 """
 
 import argparse, random
-import 2048_bitboard as ai           # the AI module we patched earlier
+import ai2048_bitboard as ai           # the AI module we patched earlier
 
 # --------------------------------------------------------------------------- #
 # 2048 helpers
