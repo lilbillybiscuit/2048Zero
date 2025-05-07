@@ -1,8 +1,4 @@
-"""
-Reward functions for 2048 Zero training
-
-This module provides reward functions for both standard and parallel training.
-"""
+"""Reward functions for 2048 Zero training."""
 
 import math
 import numpy as np
@@ -14,32 +10,14 @@ _global_max_score = 50000  # Default starting value
 
 # Module-level reward functions that are pickle-friendly for multiprocessing
 def score_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, str]:
-    """
-    Score-based reward function that's pickle-friendly for multiprocessing
-    
-    Args:
-        state: Final game state
-        stats: Game statistics dictionary
-        
-    Returns:
-        tuple: (reward_value, reward_name)
-    """
+    """Score-based reward function using unbounded log scale."""
     score = stats['score']
     # Use raw log score without normalization to [-1,1]
     z = math.log(score + 100)
     return z, "unbounded_score"
 
 def dynamic_score_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, str]:
-    """
-    Dynamic score-based reward function that adapts to the highest observed score
-    
-    Args:
-        state: Final game state
-        stats: Game statistics dictionary
-        
-    Returns:
-        tuple: (reward_value, reward_name)
-    """
+    """Dynamic score-based reward that adapts to highest observed score."""
     global _global_max_score
     score = stats['score']
     
@@ -53,32 +31,14 @@ def dynamic_score_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[
     return z, "unbounded_dynamic_score"
 
 def max_tile_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, str]:
-    """
-    Max tile reward function that's pickle-friendly for multiprocessing
-    
-    Args:
-        state: Final game state
-        stats: Game statistics dictionary
-        
-    Returns:
-        tuple: (reward_value, reward_name)
-    """
+    """Reward based on maximum tile achieved in the game."""
     max_tile = stats['max_tile']
     # Use log2 of max tile directly without normalization
     z = math.log2(int(max_tile) + 1)
     return z, "unbounded_max_tile"
 
 def hybrid_reward_func(state: GameState, stats: Dict[str, Any]) -> Tuple[float, str]:
-    """
-    Hybrid reward function that's pickle-friendly for multiprocessing
-    
-    Args:
-        state: Final game state
-        stats: Game statistics dictionary
-        
-    Returns:
-        tuple: (reward_value, reward_name)
-    """
+    """Combines score and max tile rewards with configurable weights."""
     # Get individual rewards
     score_val, _ = score_reward_func(state, stats)
     tile_val, _ = max_tile_reward_func(state, stats)
@@ -103,42 +63,22 @@ class RewardFunction:
     """Base class for reward functions in 2048 Zero training"""
 
     def __init__(self, name: str):
-        """Initialize reward function
-        
-        Args:
-            name: Name of the reward function (for logging)
-        """
+        """Initialize reward function with a name"""
         self.name = name
     
     def __call__(self, game_stats: Dict[str, Any]) -> float:
-        """Calculate reward value from game statistics
-        
-        Args:
-            game_stats: Dictionary of game statistics including 'score', 'max_tile', etc.
-            
-        Returns:
-            float: Reward value in range [-1, 1]
-        """
+        """Calculate reward value from game statistics"""
         raise NotImplementedError("Reward function must be implemented")
     
     def get_key_metric(self) -> str:
-        """Get the key metric name used for this reward function
-        
-        Returns:
-            str: Key metric name (e.g., 'score', 'max_tile')
-        """
+        """Get the key metric name used for this reward function"""
         raise NotImplementedError("Key metric must be specified")
     
     def __str__(self) -> str:
         return f"RewardFunction({self.name})"
     
     def to_func(self) -> Callable[[GameState, Dict[str, Any]], Tuple[float, str]]:
-        """
-        Convert this reward function to a function format for multiprocessing
-        
-        Returns:
-            Function that takes state and stats, returning (reward_value, reward_name)
-        """
+        """Convert to a function format for multiprocessing"""
         raise NotImplementedError("Conversion to function must be implemented")
 
 
@@ -298,15 +238,7 @@ class HybridReward(RewardFunction):
 
 # Default reward function factory
 def get_reward_function(reward_type: str = "score", **kwargs) -> RewardFunction:
-    """Get reward function by type
-    
-    Args:
-        reward_type: Type of reward function ('score', 'max_tile', 'dynamic_score', or 'hybrid')
-        **kwargs: Additional arguments for the reward function
-        
-    Returns:
-        RewardFunction instance
-    """
+    """Get reward function by type (score, max_tile, dynamic_score, hybrid)"""
     if reward_type == "score":
         max_score = kwargs.get("max_score", 50000)
         return ScoreReward(max_score=max_score)
@@ -345,15 +277,7 @@ def get_reward_function(reward_type: str = "score", **kwargs) -> RewardFunction:
 
 # Helper function to convert a reward function instance to a multiprocessing-compatible function
 def get_reward_func(reward_type: str = "score") -> Callable[[GameState, Dict[str, Any]], Tuple[float, str]]:
-    """
-    Get a multiprocessing-compatible reward function by type
-    
-    Args:
-        reward_type: Type of reward function ('score', 'dynamic_score', 'max_tile', or 'hybrid')
-        
-    Returns:
-        Function with signature (state, stats) -> (reward_value, reward_name)
-    """
+    """Get a multiprocessing-compatible reward function by type."""
     if reward_type == "score":
         return score_reward_func
     elif reward_type == "dynamic_score":

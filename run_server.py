@@ -204,7 +204,6 @@ def initialize_model(config):
     """Initialize model from scratch or checkpoint"""
     import torch
     import os
-    import sys
     import re
     from zero.game import GameRules
     from zero.zeromodel import ZeroNetwork
@@ -233,42 +232,33 @@ def initialize_model(config):
         resume_path = config.get("resume_from")
         logger.info(f"Attempting to resume from checkpoint: {resume_path}")
         
-        # Handle R2 URLs if needed
         if resume_path.startswith("r2://"):
             try:
-                # Use the existing storage adapter with R2 credentials from the config
-                logger.info(f"Downloading checkpoint from R2 using storage adapter: {resume_path}")
+                logger.info(f"Downloading checkpoint from R2: {resume_path}")
                 
-                # Make sure storage adapter is initialized
                 if storage_adapter is None:
                     logger.error("Storage adapter not initialized before model initialization!")
                     raise RuntimeError("Storage adapter must be initialized before model")
                 
-                # Check if storage adapter is using R2 backend
                 if not config.get("use_r2", False):
                     logger.error("R2 URL specified but R2 storage backend not configured")
                     logger.error("Please run with --use-r2 and R2 credentials")
                     config["resume"] = False
                 else:
-                    # Parse R2 URL to get bucket and key
                     _, bucket_key = resume_path.split("://", 1)
                     bucket, key = bucket_key.split("/", 1)
                     
-                    # Check if bucket matches configured bucket
                     config_bucket = config.get("r2_bucket", "")
                     if bucket != config_bucket:
                         logger.warning(f"R2 bucket in URL ({bucket}) doesn't match configured bucket ({config_bucket})")
                     
-                    # Use storage adapter's backend to generate a signed URL
                     if hasattr(storage_adapter.backend, "s3"):
-                        # Get a presigned URL
                         signed_url = storage_adapter.backend.s3.generate_presigned_url(
                             'get_object',
                             Params={'Bucket': bucket, 'Key': key},
                             ExpiresIn=3600
                         )
                         
-                        # Download from signed URL
                         weights_dir = config.get("weights_dir", "weights")
                         os.makedirs(weights_dir, exist_ok=True)
                         local_filename = os.path.join(weights_dir, os.path.basename(key))
@@ -293,27 +283,21 @@ def initialize_model(config):
                 logger.error("Starting fresh")
                 config["resume"] = False
         
-        # Handle HTTP URLs if needed
         elif resume_path.startswith(("http://", "https://")):
             try:
-                # Download directly using requests without checkpoint_utils
                 logger.info(f"Downloading checkpoint from URL: {resume_path}")
                 
-                # Prepare local file path
                 weights_dir = config.get("weights_dir", "weights")
                 os.makedirs(weights_dir, exist_ok=True)
                 local_filename = os.path.join(weights_dir, os.path.basename(resume_path))
                 
-                # Download the file with progress tracking
                 import requests
                 logger.info(f"Downloading to {local_filename}...")
                 response = requests.get(resume_path, stream=True, timeout=60)
                 response.raise_for_status()
                 
-                # Get total file size for tracking
                 total_size = int(response.headers.get('content-length', 0))
                 
-                # Download with progress logging
                 with open(local_filename, 'wb') as f:
                     if total_size == 0:
                         logger.info("Unknown file size, downloading...")
@@ -324,15 +308,13 @@ def initialize_model(config):
                             if chunk:
                                 f.write(chunk)
                                 downloaded += len(chunk)
-                                # Log progress occasionally
-                                if downloaded % (1024*1024) == 0:  # Every 1MB
+                                if downloaded % (1024*1024) == 0:
                                     progress = downloaded / total_size * 100
                                     logger.info(f"Download progress: {progress:.1f}% ({downloaded/(1024*1024):.1f} MB)")
                 
                 logger.info(f"Successfully downloaded to: {local_filename}")
                 resume_path = local_filename
                 
-                # Try to download run data if it exists
                 try:
                     run_url = resume_path.replace(".pt", "_run.json")
                     run_path = os.path.join(weights_dir, os.path.basename(run_url))
@@ -343,10 +325,9 @@ def initialize_model(config):
                             f.write(run_response.content)
                         logger.info(f"Also downloaded run data to {run_path}")
                 except Exception as e:
-                    logger.info(f"Note: Could not download run data: {e}")
+                    logger.info(f"Could not download run data: {e}")
             except Exception as e:
                 logger.error(f"Error downloading checkpoint: {e}")
-                logger.error(f"Exception details: {str(e)}")
                 config["resume"] = False
         
         # Make sure we can access the checkpoint file
