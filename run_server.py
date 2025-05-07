@@ -236,42 +236,117 @@ def initialize_model(config):
         # Handle R2 URLs if needed
         if resume_path.startswith("r2://"):
             try:
-                # Import checkpoint utility for R2 download
-                sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-                import checkpoint_utils
+                # Use the existing storage adapter with R2 credentials from the config
+                logger.info(f"Downloading checkpoint from R2 using storage adapter: {resume_path}")
                 
-                logger.info(f"Downloading checkpoint from R2: {resume_path}")
-                local_path = checkpoint_utils.download_checkpoint_from_r2(resume_path)
+                # Make sure storage adapter is initialized
+                if storage_adapter is None:
+                    logger.error("Storage adapter not initialized before model initialization!")
+                    raise RuntimeError("Storage adapter must be initialized before model")
                 
-                if local_path:
-                    resume_path = local_path
-                    logger.info(f"Successfully downloaded to: {resume_path}")
-                else:
-                    logger.error("Failed to download checkpoint from R2. Starting fresh.")
+                # Check if storage adapter is using R2 backend
+                if not config.get("use_r2", False):
+                    logger.error("R2 URL specified but R2 storage backend not configured")
+                    logger.error("Please run with --use-r2 and R2 credentials")
                     config["resume"] = False
-            except ImportError:
-                logger.error("checkpoint_utils module not available, cannot download from R2")
-                logger.error("Make sure boto3 is installed (pip install boto3)")
+                else:
+                    # Parse R2 URL to get bucket and key
+                    _, bucket_key = resume_path.split("://", 1)
+                    bucket, key = bucket_key.split("/", 1)
+                    
+                    # Check if bucket matches configured bucket
+                    config_bucket = config.get("r2_bucket", "")
+                    if bucket != config_bucket:
+                        logger.warning(f"R2 bucket in URL ({bucket}) doesn't match configured bucket ({config_bucket})")
+                    
+                    # Use storage adapter's backend to generate a signed URL
+                    if hasattr(storage_adapter.backend, "s3"):
+                        # Get a presigned URL
+                        signed_url = storage_adapter.backend.s3.generate_presigned_url(
+                            'get_object',
+                            Params={'Bucket': bucket, 'Key': key},
+                            ExpiresIn=3600
+                        )
+                        
+                        # Download from signed URL
+                        weights_dir = config.get("weights_dir", "weights")
+                        os.makedirs(weights_dir, exist_ok=True)
+                        local_filename = os.path.join(weights_dir, os.path.basename(key))
+                        
+                        logger.info(f"Downloading from R2 to {local_filename}...")
+                        import requests
+                        response = requests.get(signed_url, stream=True, timeout=60)
+                        response.raise_for_status()
+                        
+                        with open(local_filename, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                        
+                        logger.info(f"Successfully downloaded to: {local_filename}")
+                        resume_path = local_filename
+                    else:
+                        logger.error("Storage adapter doesn't have R2/S3 client configured correctly")
+                        config["resume"] = False
+            except Exception as e:
+                logger.error(f"Failed to download checkpoint from R2: {e}")
+                logger.error("Starting fresh")
                 config["resume"] = False
         
         # Handle HTTP URLs if needed
         elif resume_path.startswith(("http://", "https://")):
             try:
-                # Import checkpoint utility for HTTP download
-                sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-                import checkpoint_utils
-                
+                # Download directly using requests without checkpoint_utils
                 logger.info(f"Downloading checkpoint from URL: {resume_path}")
-                local_path = checkpoint_utils.download_checkpoint(resume_path)
                 
-                if local_path:
-                    resume_path = local_path
-                    logger.info(f"Successfully downloaded to: {resume_path}")
-                else:
-                    logger.error("Failed to download checkpoint from URL. Starting fresh.")
-                    config["resume"] = False
+                # Prepare local file path
+                weights_dir = config.get("weights_dir", "weights")
+                os.makedirs(weights_dir, exist_ok=True)
+                local_filename = os.path.join(weights_dir, os.path.basename(resume_path))
+                
+                # Download the file with progress tracking
+                import requests
+                logger.info(f"Downloading to {local_filename}...")
+                response = requests.get(resume_path, stream=True, timeout=60)
+                response.raise_for_status()
+                
+                # Get total file size for tracking
+                total_size = int(response.headers.get('content-length', 0))
+                
+                # Download with progress logging
+                with open(local_filename, 'wb') as f:
+                    if total_size == 0:
+                        logger.info("Unknown file size, downloading...")
+                        f.write(response.content)
+                    else:
+                        downloaded = 0
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                # Log progress occasionally
+                                if downloaded % (1024*1024) == 0:  # Every 1MB
+                                    progress = downloaded / total_size * 100
+                                    logger.info(f"Download progress: {progress:.1f}% ({downloaded/(1024*1024):.1f} MB)")
+                
+                logger.info(f"Successfully downloaded to: {local_filename}")
+                resume_path = local_filename
+                
+                # Try to download run data if it exists
+                try:
+                    run_url = resume_path.replace(".pt", "_run.json")
+                    run_path = os.path.join(weights_dir, os.path.basename(run_url))
+                    
+                    run_response = requests.get(run_url, timeout=10)
+                    if run_response.status_code == 200:
+                        with open(run_path, 'wb') as f:
+                            f.write(run_response.content)
+                        logger.info(f"Also downloaded run data to {run_path}")
+                except Exception as e:
+                    logger.info(f"Note: Could not download run data: {e}")
             except Exception as e:
                 logger.error(f"Error downloading checkpoint: {e}")
+                logger.error(f"Exception details: {str(e)}")
                 config["resume"] = False
         
         # Make sure we can access the checkpoint file

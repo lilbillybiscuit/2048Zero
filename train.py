@@ -37,7 +37,13 @@ def main():
     
     args = parser.parse_args()
     
-    # Handle R2 URLs for checkpoint resuming
+    # TEMPORARILY DISABLED: Checkpoint resuming code
+    # For now, we'll force these values to start fresh
+    args.resume = False
+    args.resume_from = None
+    
+    """
+    # Handle R2 URLs for checkpoint resuming - DISABLED
     if args.resume and args.resume_from:
         # Only handle R2 URLs, no need for HTTP URLs
         if args.resume_from.startswith("r2://"):
@@ -66,6 +72,7 @@ def main():
             print(f"WARNING: Checkpoint file {args.resume_from} not found. Starting fresh.")
             args.resume = False
             args.resume_from = None
+    """
     
     # Initialize game rules, model, and player
     rules = GameRules(num_spawn_tiles_per_move=1)

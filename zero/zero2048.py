@@ -711,7 +711,13 @@ class ZeroTrainer:
         if self.monitor.use_wandb and not self.monitor.wandb_initialized:
             self.monitor.init_wandb(watch_model=self.model)
         
-        # Handle resuming from checkpoint
+        # TEMPORARILY DISABLED: Checkpoint resumption functionality
+        start_epoch = 0
+        # Force resume to False
+        resume = False
+        
+        """
+        # Handle resuming from checkpoint - DISABLED
         start_epoch = 0
         if resume and resume_from:
             print(f"Resuming training from checkpoint: {resume_from}")
@@ -803,67 +809,7 @@ class ZeroTrainer:
                         print(f"Error loading run data: {e}")
             else:
                 print(f"Warning: Checkpoint file {resume_from} not found. Starting fresh.")
-                # Create checkpoints directory if it doesn't exist
-                os.makedirs("checkpoints", exist_ok=True)
-
-                # Download the checkpoint
-                response = requests.get(resume_from, timeout=60)
-                response.raise_for_status()
-
-                # Extract filename from URL or use a default
-                if "/" in resume_from:
-                    local_path = os.path.join("checkpoints", resume_from.split("/")[-1])
-                else:
-                    local_path = os.path.join("checkpoints", "downloaded_checkpoint.pth")
-
-                # Save the checkpoint
-                with open(local_path, 'wb') as f:
-                    f.write(response.content)
-
-                print(f"Successfully downloaded checkpoint to {local_path}")
-                resume_from = local_path
-
-                # Also try to download the run file
-                run_url = resume_from.replace(".pth", "_run.json").replace("_epoch_", "_run")
-                try:
-                    run_response = requests.get(run_url, timeout=30)
-                    run_response.raise_for_status()
-
-                    local_run_path = local_path.replace(".pth", "_run.json").replace("_epoch_", "_run")
-                    with open(local_run_path, 'wb') as f:
-                        f.write(run_response.content)
-
-                    print(f"Successfully downloaded run data to {local_run_path}")
-                except Exception as e:
-                    print(f"Note: Could not download run data: {e}")
-
-            # Now try to load the local checkpoint
-            if os.path.exists(resume_from):
-                # Extract epoch number from filename
-                checkpoint_file = os.path.basename(resume_from)
-                if "_epoch_" in checkpoint_file:
-                    try:
-                        start_epoch = int(checkpoint_file.split("_epoch_")[1].split(".")[0]) + 1
-                    except:
-                        print("Could not determine epoch from filename, starting from 0")
-                
-                # Load model weights
-                state_dict = torch.load(resume_from, map_location='cpu')
-                self.model.load_state_dict(state_dict)
-                print(f"Successfully loaded model from checkpoint. Resuming from epoch {start_epoch}")
-                
-                # Also try to load run data
-                run_file = resume_from.replace(".pth", "_run.json").replace("_epoch_", "_run")
-                if os.path.exists(run_file):
-                    import json
-                    try:
-                        with open(run_file, 'r') as f:
-                            self.monitor.run_data = json.load(f)
-                        print(f"Successfully loaded run data from {run_file}")
-                    except Exception as e:
-                        print(f"Error loading run data: {e}")
-            else:
-                print(f"Warning: Checkpoint file {resume_from} not found. Starting fresh.")
+        """
         
         # Initialize optimizer with specified learning rate
         optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
