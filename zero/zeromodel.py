@@ -5,11 +5,10 @@ from typing import List, Tuple, Any, Dict, Optional, Union
 import torch.nn.functional as F
 import numpy as np
 
-device = 'cpu'
-if torch.cuda.is_available():
-    device = 'cuda'
-elif torch.backends.mps.is_available():
-    device = 'mps'
+# Default device - but don't auto-set it here
+# This causes all workers to try using CUDA
+# Instead, each model instance should set its own device based on constructor parameter
+default_device = 'cpu'
 
 
 class ZeroResidualBlock(nn.Module):
@@ -178,4 +177,4 @@ class ZeroNetworkMini(ZeroNetworkMain):
         return policy_out, value_out
 
 
-ZeroNetwork = ZeroNetworkMini
+ZeroNetwork = ZeroNetworkMain

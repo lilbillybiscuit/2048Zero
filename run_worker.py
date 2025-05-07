@@ -161,13 +161,14 @@ class Worker:
         return weights_data
     
     def load_model(self, weights_data: bytes, model_config: Dict[str, Any]):
-        """Load model from weights data with robust error handling"""
+        """Load model from weights data with strict device enforcement"""
         try:
             # Log model configuration for debugging
             logger.info(f"Creating model with config: height={self.rules.height}, width={self.rules.width}, "
-                       f"k_channels={model_config.get('k_channels')}, filters={model_config.get('filters', 128)}")
+                       f"k_channels={model_config.get('k_channels')}, filters={model_config.get('filters', 128)}, "
+                       f"target_device={self.device}")
             
-            # Create model with configuration
+            # Create model with configuration - SPECIFY CPU EXPLICITLY
             model = ZeroNetwork(
                 self.rules.height, 
                 self.rules.width,
@@ -176,31 +177,45 @@ class Worker:
                 blocks=model_config.get("blocks", 10)
             )
             
-            # Load weights with robust error handling
+            # Load weights with strict device enforcement
             try:
-                # First try to load directly to the target device
+                # Always load to CPU first for consistency
                 buffer = io.BytesIO(weights_data)
-                try:
-                    # Try loading directly to target device first
-                    state_dict = torch.load(buffer, map_location=self.device)
-                except RuntimeError:
-                    # If that fails, load to CPU first
-                    buffer.seek(0)  # Reset buffer position
-                    logger.warning(f"Loading to {self.device} failed, trying CPU first")
-                    state_dict = torch.load(buffer, map_location="cpu")
+                state_dict = torch.load(buffer, map_location="cpu")
                 
-                # Load state dict
+                # Load state dict while model is on CPU
                 model.load_state_dict(state_dict)
                 
-                # Move model to device and set to eval mode
-                model = model.to(self.device)
+                # Now explicitly move to the requested device
+                if self.device.startswith("cuda"):
+                    logger.info(f"Moving model to {self.device}")
+                    model = model.to(self.device)
+                elif self.device == "cpu":
+                    logger.info("Using CPU as requested - model will stay on CPU")
+                    # Model already on CPU, no action needed
+                else:
+                    # Other device types like MPS
+                    logger.info(f"Moving model to other device type: {self.device}")
+                    model = model.to(self.device)
+                
+                # Set to eval mode after moving
                 model.eval()
                 
-                # Verify the model is on the correct device
+                # Verify model is on correct device
                 param_device = next(model.parameters()).device
-                logger.info(f"Model loaded successfully to {param_device} (requested: {self.device})")
+                device_type = str(param_device).split(":")[0]  # Extract just cpu/cuda part
+                requested_type = self.device.split(":")[0]     # Extract just cpu/cuda part
+                
+                if device_type != requested_type:
+                    logger.error(f"MODEL DEVICE MISMATCH! Requested: {self.device}, actual: {param_device}")
+                    # This shouldn't happen, but if it does, force it back
+                    model = model.to(self.device)
+                    logger.info(f"Forced model onto correct device: {self.device}")
+                else:
+                    logger.info(f"Model loaded successfully onto {param_device} (requested: {self.device})")
                 
                 return model
+                
             except Exception as e:
                 logger.exception(f"Error loading model weights: {e}")
                 return None
