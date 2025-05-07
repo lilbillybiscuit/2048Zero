@@ -289,8 +289,10 @@ def main_training_loop(config):
         # 7. Update shared state with new model
         shared_state.update_model(current_revision, weights_path, weights_url, weights_sha256)
 
-        # 8. Clean up old models
-        storage_adapter.cleanup_old_models(config.get("keep_revisions", 5))
+        # 8. Clean up old models while safely preserving the current revision
+        keep_revisions = config.get("keep_revisions", 5)
+        storage_adapter.cleanup_old_models(keep_revisions, current_revision=current_revision)
+        logger.info(f"Weight cleanup completed: kept {keep_revisions} revisions and preserved revision {current_revision}")
 
         # 9. Update current model
         current_model = new_model

@@ -59,8 +59,14 @@ class LocalStorageBackend(StorageBackend):
         host = "localhost" if self.http_host == "0.0.0.0" else self.http_host
         return f"http://{host}:{self.http_port}/weights/{revision}"
             
-    def cleanup_old_weights(self, keep_revisions: int = 5) -> None:
-        """Remove old weight files, keeping the most recent ones"""
+    def cleanup_old_weights(self, keep_revisions: int = 5, current_revision: int = None) -> None:
+        """
+        Remove old weight files, keeping the most recent ones and always preserving the current revision
+        
+        Args:
+            keep_revisions: Number of revisions to keep
+            current_revision: Current active revision that should never be deleted (if provided)
+        """
         if not os.path.exists(self.weights_dir):
             return
             
@@ -76,8 +82,23 @@ class LocalStorageBackend(StorageBackend):
                     
         weight_files.sort(reverse=True)
         
-        # Keep the latest 'keep_revisions' files
-        for rev, file_path in weight_files[keep_revisions:]:
+        # Identify files to keep
+        files_to_keep = weight_files[:keep_revisions]
+        files_to_delete = weight_files[keep_revisions:]
+        
+        # If current_revision is provided, ensure it's in the files to keep
+        if current_revision is not None:
+            current_revision_path = os.path.join(self.weights_dir, f"r{current_revision}.pt")
+            current_revision_tuple = (current_revision, current_revision_path)
+            
+            # If current revision is in the delete list, remove it from there and add to keep list
+            if current_revision_tuple in files_to_delete:
+                logger.info(f"Preserving current revision {current_revision} from cleanup")
+                files_to_delete.remove(current_revision_tuple)
+                files_to_keep.append(current_revision_tuple)
+        
+        # Delete files not in the keep list
+        for rev, file_path in files_to_delete:
             logger.info(f"Cleaning up old weights: {file_path}")
             try:
                 os.remove(file_path)
@@ -144,8 +165,14 @@ class R2StorageBackend(StorageBackend):
         assert self.r2_public_url, "R2 public URL is not set"
         return f"{self.r2_public_url.rstrip('/')}/weights/r{revision}.pt"
 
-    def cleanup_old_weights(self, keep_revisions: int = 5) -> None:
-        """Remove old weight files from R2 and local cache"""
+    def cleanup_old_weights(self, keep_revisions: int = 5, current_revision: int = None) -> None:
+        """
+        Remove old weight files from R2 and local cache, preserving current revision
+        
+        Args:
+            keep_revisions: Number of revisions to keep
+            current_revision: Current active revision that should never be deleted (if provided)
+        """
         # List objects in R2
         response = self.s3.list_objects_v2(
             Bucket=self.bucket_name,
@@ -167,17 +194,32 @@ class R2StorageBackend(StorageBackend):
                     continue
 
         objects.sort(reverse=True)
+        
+        # Identify objects to keep and delete
+        objects_to_keep = objects[:keep_revisions]
+        objects_to_delete = objects[keep_revisions:]
+        
+        # If current_revision is provided, ensure it's preserved
+        if current_revision is not None:
+            current_key = f"weights/r{current_revision}.pt"
+            current_tuple = (current_revision, current_key)
+            
+            # If current revision is in the delete list, remove it from there and add to keep list
+            if current_tuple in objects_to_delete:
+                logger.info(f"Preserving current revision {current_revision} from R2 cleanup")
+                objects_to_delete.remove(current_tuple)
+                objects_to_keep.append(current_tuple)
 
-        # Delete old objects
-        for rev, key in objects[keep_revisions:]:
+        # Delete old objects not in the keep list
+        for rev, key in objects_to_delete:
             logger.info(f"Cleaning up old weights from R2: {key}")
             try:
                 self.s3.delete_object(Bucket=self.bucket_name, Key=key)
             except Exception as e:
                 logger.warning(f"Failed to delete object {key} from R2: {e}")
 
-        # Also cleanup local cache
-        LocalStorageBackend(self.weights_dir).cleanup_old_weights(keep_revisions)
+        # Also cleanup local cache, passing current_revision
+        LocalStorageBackend(self.weights_dir).cleanup_old_weights(keep_revisions, current_revision)
 
 class StorageAdapter:
     """Storage adapter that selects the appropriate backend"""
@@ -219,6 +261,13 @@ class StorageAdapter:
         url = self.backend.get_weights_url(path_or_key, revision)
         return path_or_key, url, sha256
         
-    def cleanup_old_models(self, keep_revisions: int = 5) -> None:
-        """Clean up old model weights"""
-        self.backend.cleanup_old_weights(keep_revisions)
+    def cleanup_old_models(self, keep_revisions: int = 5, current_revision: int = None) -> None:
+        """
+        Clean up old model weights while preserving the current active revision
+        
+        Args:
+            keep_revisions: Number of revisions to keep
+            current_revision: Current active revision that should never be deleted
+        """
+        logger.info(f"Cleaning up old weights, keeping {keep_revisions} revisions and preserving revision {current_revision}")
+        self.backend.cleanup_old_weights(keep_revisions, current_revision)

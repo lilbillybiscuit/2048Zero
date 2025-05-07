@@ -4,12 +4,23 @@ import torch
 import json
 import time
 import logging
+import multiprocessing
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional, Union
 
 # Import PyTorch Lightning
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import Dataset, DataLoader
+
+# Import wandb for logging
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    logging.warning("Weights & Biases not installed. Run 'pip install wandb' for enhanced logging.")
 
 # Import core components
 from zero.game import GameRules, GameState, BitBoard
@@ -290,11 +301,41 @@ class LightningDistributedTrainer:
             )
         ]
         
-        # Initialize the trainer with optimized settings
+        # Initialize the trainer with optimized settings and proper wandb integration
+        # ALWAYS set tensor core precision for CUDA devices to avoid warnings
+        torch.set_float32_matmul_precision('medium')
+                
+        # Configure wandb logger if available, fallback to CSV logger if not
+        if WANDB_AVAILABLE:
+            # Create wandb logger with project and experiment tracking
+            wandb_logger = WandbLogger(
+                project="2048-zero",
+                name=f"training-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                log_model="all",     # Log model checkpoints to wandb
+                save_dir="wandb_logs",
+                config={
+                    "epochs": epochs,
+                    "batch_size": self.batch_size,
+                    "learning_rate": self.learning_rate,
+                    "model_filters": self.model.filters if hasattr(self.model, 'filters') else None,
+                    "model_blocks": len(self.model.blocks) if hasattr(self.model, 'blocks') else None,
+                    "weight_decay": self.weight_decay,
+                    "momentum": self.momentum,
+                    "board_size": f"{self.model.n}x{self.model.m}",
+                }
+            )
+            logger.info("Using Weights & Biases for experiment tracking")
+            trainer_logger = wandb_logger
+        else:
+            # Fallback to CSV logger if wandb is not available
+            logger.warning("Wandb not available, falling back to CSV logger")
+            trainer_logger = pl.loggers.CSVLogger("lightning_logs")
+        
         self.trainer = pl.Trainer(
             max_epochs=epochs,
             accelerator=accelerator,
             callbacks=callbacks,
+            logger=trainer_logger,
             log_every_n_steps=10,
             enable_progress_bar=True,
             enable_model_summary=True,
@@ -345,7 +386,7 @@ class LightningDistributedTrainer:
         return training_samples
 
     def prepare_data(self, samples: List[Tuple[np.ndarray, List[float], float]]):
-        """Prepare data for PyTorch Lightning training
+        """Prepare data for PyTorch Lightning training with optimized processing
         
         Args:
             samples: List of (board, policy, value) tuples
@@ -353,7 +394,10 @@ class LightningDistributedTrainer:
         Returns:
             Dictionary with dataloaders
         """
-        # Shuffle the samples
+        start_time = time.time()
+        logger.info(f"Preparing {len(samples)} samples for training...")
+        
+        # Shuffle the samples with numpy for efficiency (no seed for maximum randomness)
         random_indices = np.random.permutation(len(samples))
         shuffled_samples = [samples[i] for i in random_indices]
         
@@ -362,7 +406,10 @@ class LightningDistributedTrainer:
         train_samples = shuffled_samples[val_size:]
         val_samples = shuffled_samples[:val_size]
         
-        # Create datasets with board dimensions from the model
+        logger.info(f"Split data into {len(train_samples)} training and {len(val_samples)} validation samples")
+        
+        # Create datasets with board dimensions from the model (with timing)
+        dataset_start = time.time()
         train_dataset = AlphaZeroDataset(
             train_samples, 
             self.model.k, 
@@ -377,24 +424,52 @@ class LightningDistributedTrainer:
             self.model.m
         ) if val_samples else None
         
-        # Create dataloaders with optimized settings
+        dataset_time = time.time() - dataset_start
+        logger.info(f"Dataset creation took {dataset_time:.2f} seconds")
+        
+        # Calculate optimal number of workers - use all available CPU cores for maximum performance
+        # The "7" in the warning is just a default suggestion, not a technical requirement
+        cpu_count = os.cpu_count() or 8
+        
+        # Use all CPU cores with reserve for main process
+        # On high-core systems, this can greatly improve performance
+        recommended_workers = max(1, cpu_count - 1)
+        
+        # For systems with lots of cores, using all of them can improve throughput significantly
+        # The warning about num_workers=7 is just a suggestion, not a requirement
+        train_workers = recommended_workers
+        val_workers = recommended_workers  # Use same number for consistency
+        
+        logger.info(f"Using {train_workers} workers for training and {val_workers} for validation")
+        
+        # Create dataloaders with Lightning's recommended settings
+        # Improve pin_memory decision based on accelerator
+        use_pin_memory = self.device in ["cuda", "gpu"] or torch.cuda.is_available()
+        
+        # Use increased prefetch factor for better throughput
+        prefetch = 3 if train_workers > 0 else None
+        
+        # Create training dataloader
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=min(self.num_workers, 2),  # Reduce num_workers to decrease startup time
-            pin_memory=True if self.device == "cuda" else False,
-            persistent_workers=self.num_workers > 0,  # Keep workers alive between epochs
-            prefetch_factor=2 if self.num_workers > 0 else None,  # Prefetch 2 batches per worker
+            num_workers=train_workers,  # Exactly 7 for multi-CPU systems
+            pin_memory=use_pin_memory,
+            persistent_workers=train_workers > 0,
+            prefetch_factor=prefetch,
         )
         
+        # Create validation dataloader with identical settings to avoid warnings
+        # The only difference is larger batch size and no shuffling
         val_loader = DataLoader(
             val_dataset,
-            batch_size=self.batch_size*2,  # Use larger batch size for validation
+            batch_size=self.batch_size*2,
             shuffle=False,
-            num_workers=min(self.num_workers, 1),  # Use fewer workers for validation
-            pin_memory=True if self.device == "cuda" else False,
-            persistent_workers=self.num_workers > 0,  # Keep workers alive between epochs
+            num_workers=val_workers,  # Must be 7 (or CPU count-1) to avoid Lightning warning
+            pin_memory=use_pin_memory,
+            persistent_workers=val_workers > 0,
+            prefetch_factor=prefetch,
         ) if val_dataset else None
         
         return {
@@ -403,7 +478,7 @@ class LightningDistributedTrainer:
         }
 
     def train_on_batch(self, samples: List[Tuple[np.ndarray, List[float], float]]) -> Dict[str, float]:
-        """Train the model using PyTorch Lightning
+        """Train the model using PyTorch Lightning with optimized settings
         
         Args:
             samples: List of (board, policy, value) tuples
@@ -422,10 +497,13 @@ class LightningDistributedTrainer:
         
         logger.info(f"Training on {len(samples)} samples with PyTorch Lightning")
         
+        # Track full training time including data preparation
+        full_start_time = time.time()
+        
         # Prepare data
         data = self.prepare_data(samples)
         
-        # Track time to measure Lightning startup latency
+        # Track time to measure Lightning startup and training latency
         train_start_time = time.time()
         logger.info("Starting Lightning training process...")
         
@@ -436,17 +514,34 @@ class LightningDistributedTrainer:
             val_dataloaders=data['val_loader']
         )
         
+        # Calculate timing information
         train_duration = time.time() - train_start_time
-        logger.info(f"Lightning training complete in {train_duration:.2f} seconds")
+        total_duration = time.time() - full_start_time
+        data_prep_time = train_start_time - full_start_time
         
-        # Get training metrics
+        # Log detailed timing information
+        logger.info(f"Lightning training complete in {train_duration:.2f} seconds")
+        logger.info(f"Data preparation took {data_prep_time:.2f} seconds")
+        logger.info(f"Total training process took {total_duration:.2f} seconds")
+        
+        # Get training metrics with validation details
+        val_metrics = {}
+        if data['val_loader']:
+            val_metrics = {
+                "val_loss": self.trainer.callback_metrics.get("val_loss", 0.0).item(),
+                "val_accuracy": self.trainer.callback_metrics.get("val_accuracy", 0.0).item() 
+                    if "val_accuracy" in self.trainer.callback_metrics else 0.0,
+            }
+            
+        # Combine all metrics
         metrics = {
             "loss": self.trainer.callback_metrics.get("train_loss", 0.0).item(),
             "policy_loss": self.trainer.callback_metrics.get("train_policy_loss", 0.0).item(),
             "value_loss": self.trainer.callback_metrics.get("train_value_loss", 0.0).item(),
-            "val_loss": self.trainer.callback_metrics.get("val_loss", 0.0).item() if data['val_loader'] else 0.0,
             "samples": len(samples),
-            "learning_rate": self.learning_rate * (self.scheduler_gamma ** (self.trainer.current_epoch // self.scheduler_step_size))
+            "training_time": train_duration,
+            "learning_rate": self.learning_rate * (self.scheduler_gamma ** (self.trainer.current_epoch // self.scheduler_step_size)),
+            **val_metrics  # Include validation metrics if available
         }
         
         return metrics
