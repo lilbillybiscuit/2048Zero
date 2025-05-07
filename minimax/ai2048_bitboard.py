@@ -122,6 +122,7 @@ def heuristic(board: int, α=-0.1, β=1.0, γ=2.7, δ=3.5):
     """Lower is worse; expectimax maximises −heuristic."""
     empt  = count_empty(board)
     smooth = mono = merges = 0
+    # import ipdb; ipdb.set_trace()
 
     for i in range(4):
         row = (board >> (16 * i)) & ROW_MASK

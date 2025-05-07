@@ -10,7 +10,7 @@ import numpy as np
 import random
 from typing import Dict, List, Tuple, Any
 
-# Type alias for clarity
+
 BoardType = np.ndarray[Any, np.dtype[np.int64]]
 
 
@@ -22,19 +22,17 @@ class Simplified2048:
         0 = Up, 1 = Right, 2 = Down, 3 = Left
     """
 
-    # Direction constants
+    
     UP: int = 0
     RIGHT: int = 1
     DOWN: int = 2
     LEFT: int = 3
     DIRECTIONS: List[int] = [UP, RIGHT, DOWN, LEFT]
 
-    # Default probability of spawning a 2‑tile or 4‑tile
+    
     DEFAULT_SPAWN_RATES: Dict[int, float] = {2: 0.9, 4: 0.1}
 
-    # --------------------------------------------------------------------- #
-    #                               INIT                                    #
-    # --------------------------------------------------------------------- #
+
     def __init__(
         self,
         height: int = 4,
@@ -46,7 +44,7 @@ class Simplified2048:
         if spawn_rates is None:
             spawn_rates = self.DEFAULT_SPAWN_RATES
 
-        # Sanity checks
+
         assert height > 0 and width > 0, "Board dimensions must be positive."
         assert num_spawn_tiles_per_move > 0, "num_spawn_tiles_per_move must be positive."
         assert num_initial_tiles > 0, "num_initial_tiles must be positive."
@@ -58,23 +56,20 @@ class Simplified2048:
         self.num_spawn_tiles_per_move: int = num_spawn_tiles_per_move
         self.num_initial_tiles: int = num_initial_tiles
 
-        # Copy spawn distribution into convenient parallel lists
+        
         self._spawn_rates: Dict[int, float] = spawn_rates.copy()
         self._spawn_values: List[int] = list(self._spawn_rates.keys())
         self._spawn_weights: List[float] = list(self._spawn_rates.values())
 
-        # Game state
+        
         self._board: BoardType = np.zeros((self.height, self.width), dtype=np.int64)
         self._score: np.int64 = np.int64(0)
         self._game_over: bool = False
 
-        # Seed initial tiles
+        
         for _ in range(self.num_initial_tiles):
             self._add_random_tile()
 
-    # ------------------------------------------------------------------ #
-    #                         PUBLIC API                                  #
-    # ------------------------------------------------------------------ #
     def get_board(self) -> BoardType:
         """Return a *copy* of the current board."""
         return self._board.copy()
@@ -105,14 +100,14 @@ class Simplified2048:
         working = self._board.copy()
         move_gain: np.int64 = np.int64(0)
 
-        # Horizontal moves
+
         if direction in (self.LEFT, self.RIGHT):
             reverse = direction == self.RIGHT
             for r in range(self.height):
                 processed, gain = self._process_line(working[r, :], reverse)
                 working[r, :] = processed
                 move_gain += gain
-        # Vertical moves
+
         else:
             reverse = direction == self.DOWN
             for c in range(self.width):
@@ -126,7 +121,6 @@ class Simplified2048:
             self._board = working
             self._score += move_gain
 
-            # Spawn new tiles
             for _ in range(self.num_spawn_tiles_per_move):
                 if not self._add_random_tile():
                     break  # board full
@@ -185,9 +179,6 @@ class Simplified2048:
         """Largest value on the current board."""
         return np.max(self._board) if self._board.size else np.int64(0)
 
-    # ------------------------------------------------------------------ #
-    #                    INTERNAL / HELPER FUNCTIONS                     #
-    # ------------------------------------------------------------------ #
     def _add_random_tile(self) -> bool:
         """Place a random tile (according to spawn rates)."""
         empties = np.argwhere(self._board == 0)
@@ -208,11 +199,12 @@ class Simplified2048:
         if reverse:
             line = line[::-1]
 
-        compressed = line[line != 0]            # eliminate zeros
+        compressed = line[line != 0]         
         result = np.zeros_like(line)
         gain = np.int64(0)
         write_idx = 0
         i = 0
+        # import ipdb; ipdb.set_trace()
         while i < len(compressed):
             v = compressed[i]
             if i + 1 < len(compressed) and v == compressed[i + 1]:
@@ -245,18 +237,14 @@ class Simplified2048:
         """Fast check for empties or adjacent equal tiles."""
         if np.any(self._board == 0):
             return True
-        # Horizontal adjacency
+
         if np.any(self._board[:, :-1] == self._board[:, 1:]):
             return True
-        # Vertical adjacency
+
         if np.any(self._board[:-1, :] == self._board[1:, :]):
             return True
         return False
 
-
-# --------------------------------------------------------------------------- #
-#                           EXAMPLE (local test)                              #
-# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     game = Simplified2048()
     print("Initial board:")
