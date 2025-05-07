@@ -286,7 +286,8 @@ def initialize_model(config):
                 revision = config.get("resume_revision")
                 if revision is None:
                     # Try to extract revision from the filename
-                    match = re.search(r'r(\d+)\.pt$', resume_path)$', resume_path)
+                    pattern = r'r(\d+)\.pt'
+                    match = re.search(pattern, resume_path)
                     if match:
                         revision = int(match.group(1))
                         logger.info(f"Extracted revision {revision} from filename")
