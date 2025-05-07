@@ -41,6 +41,7 @@ class LocalStorageBackend(StorageBackend):
     def save_weights(self, model, revision: int) -> Tuple[str, str]:
         """Save model weights to local file"""
         weights_path = os.path.join(self.weights_dir, f"r{revision}.pt")
+        logger.debug(f"Saving model weights to: {weights_path} (revision {revision})")
         torch.save(model.state_dict(), weights_path)
         
         # Compute SHA256 hash
@@ -50,6 +51,7 @@ class LocalStorageBackend(StorageBackend):
                 sha256.update(chunk)
         weights_sha256 = sha256.hexdigest()
         
+        logger.debug(f"Model weights saved successfully: {weights_path} (SHA256: {weights_sha256[:8]}...)")
         return weights_path, weights_sha256
         
     def get_weights_url(self, path_or_key: str, revision: int) -> str:
@@ -180,13 +182,20 @@ class R2StorageBackend(StorageBackend):
 class StorageAdapter:
     """Storage adapter that selects the appropriate backend"""
     
+    # Keep track of instances to prevent multiple initializations
+    _instance_count = 0
+    
     def __init__(self, config):
         self.config = config
+        
+        # Generate a unique identifier for this instance
+        StorageAdapter._instance_count += 1
+        self.instance_id = StorageAdapter._instance_count
         
         # Initialize backend based on configuration
         if config.get("use_r2", False):
             # Use R2 backend if configured and boto3 is available
-            logger.info("Using R2 storage backend")
+            logger.info(f"StorageAdapter (ID: {self.instance_id}): Initializing R2 storage backend")
             self.backend = R2StorageBackend(
                 bucket_name=config.get("r2_bucket", "2048Zero"),
                 r2_account_id=config.get("r2_account_id", ""),
@@ -196,7 +205,7 @@ class StorageAdapter:
                 weights_dir=config.get("weights_dir", "weights")
             )
         else:
-            logger.info("Using local storage backend")
+            logger.info(f"StorageAdapter (ID: {self.instance_id}): Initializing local storage backend")
             self.backend = LocalStorageBackend(
                 weights_dir=config.get("weights_dir", "weights"),
                 http_host=config.get("host", None) if config.get("localhost_weights", False) else None,
@@ -205,6 +214,7 @@ class StorageAdapter:
     
     def save_model(self, model, revision: int) -> Tuple[str, str, str]:
         """Save model weights and return (path_or_key, url, sha256)"""
+        logger.debug(f"StorageAdapter (ID: {self.instance_id}): Saving model revision {revision}")
         path_or_key, sha256 = self.backend.save_weights(model, revision)
         url = self.backend.get_weights_url(path_or_key, revision)
         return path_or_key, url, sha256

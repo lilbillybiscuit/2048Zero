@@ -79,7 +79,7 @@ class Worker:
         # For binary responses (weights download)
         is_binary = kwargs.pop('binary', False)
         
-        max_retries = 5
+        max_retries = 2
         retry_delay = 2.0
         
         for attempt in range(max_retries):
@@ -99,6 +99,10 @@ class Worker:
                 if hasattr(e, 'response') and e.response and e.response.status_code < 500 and e.response.status_code != 429:
                     error_details = e.response.json() if e.response.content else {"error": str(e)}
                     return False, error_details
+
+                # if 409 conflict, immediately stop trying
+                if hasattr(e, 'response') and e.response and e.response.status_code == 409:
+                    return False, {"error": "Conflict: server is busy or in training mode"}
                     
                 if attempt < max_retries - 1:
                     logger.info(f"Retrying in {retry_delay}s...")

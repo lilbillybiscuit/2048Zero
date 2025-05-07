@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 import json
+import time
 import logging
 from typing import List, Dict, Any, Tuple, Optional, Union
 
@@ -17,7 +18,7 @@ from zero.zeromodel import ZeroNetwork
 logger = logging.getLogger(__name__)
 
 class AlphaZeroDataset(Dataset):
-    """Dataset for AlphaZero training samples"""
+    """Dataset for AlphaZero training samples with optimized preprocessing"""
     
     def __init__(self, samples: List[Tuple[np.ndarray, List[float], float]], k: int, board_height: int, board_width: int):
         """
@@ -31,7 +32,14 @@ class AlphaZeroDataset(Dataset):
         self.k = k
         self.board_height = board_height
         self.board_width = board_width
-        self.boards, self.policies, self.values = [], [], []
+        
+        # Pre-process data once during initialization to speed up training
+        self.boards = []
+        self.policies = []
+        self.values = []
+        
+        # Vectorized conversion
+        start_time = time.time()
         
         # Process samples into tensors
         for board, policy, value in samples:
@@ -52,39 +60,42 @@ class AlphaZeroDataset(Dataset):
             self.values.append(float(value))
             
         self.boards = np.array(self.boards, dtype=np.int32)
-        self.policies = np.array(self.policies, dtype=np.float32)
-        self.values = np.array(self.values, dtype=np.float32).reshape(-1, 1)
+        self.policies = torch.tensor(np.array(self.policies, dtype=np.float32), dtype=torch.float32)
+        self.values = torch.tensor(np.array(self.values, dtype=np.float32).reshape(-1, 1), dtype=torch.float32)
+        
+        # Pre-compute one-hot encodings
+        self.onehot_boards = self._precompute_onehot_encodings()
+        
+        logging.debug(f"Dataset initialization took {time.time() - start_time:.2f} seconds")
+    
+    def _precompute_onehot_encodings(self):
+        """Pre-compute all one-hot encodings to avoid doing it at runtime"""
+        batch_size = len(self.boards)
+        onehot_shape = (batch_size, self.k, self.board_height, self.board_width)
+        onehot_boards = torch.zeros(onehot_shape, dtype=torch.float32)
+        
+        # Use F.one_hot for efficient encoding
+        for b, board in enumerate(self.boards):
+            # Convert board to tensor
+            board_tensor = torch.tensor(board, dtype=torch.long)
+            
+            # Fill the one-hot tensor
+            for i in range(self.board_height):
+                for j in range(self.board_width):
+                    value = min(int(board[i, j]), self.k - 1)
+                    onehot_boards[b, value, i, j] = 1.0
+        
+        return onehot_boards
     
     def __len__(self):
         return len(self.samples)
     
-    def to_onehot(self, board):
-        """Create one-hot encoding of the board manually"""
-        # Create an empty tensor of zeros with shape (k, height, width)
-        onehot = np.zeros((self.k, self.board_height, self.board_width), dtype=np.float32)
-        
-        # Fill in the appropriate positions with 1s
-        for i in range(self.board_height):
-            for j in range(self.board_width):
-                # Get the value at position (i, j), clamped to valid range
-                value = min(int(board[i, j]), self.k - 1)
-                onehot[value, i, j] = 1.0
-                
-        return onehot
-    
     def __getitem__(self, idx):
-        board = self.boards[idx]
-        policy = torch.tensor(self.policies[idx], dtype=torch.float32)
-        value = torch.tensor(self.values[idx], dtype=torch.float32)
-        
-        # Create one-hot encoding manually to avoid tensor type issues
-        board_onehot = torch.tensor(self.to_onehot(board), dtype=torch.float32)
-        
-        # Return the tensors
+        """Fast item getter using pre-computed tensors"""
         return {
-            'board_onehot': board_onehot,  # Pre-processed board
-            'policy': policy,
-            'value': value
+            'board_onehot': self.onehot_boards[idx],
+            'policy': self.policies[idx],
+            'value': self.values[idx]
         }
 
 class AlphaZeroModel(pl.LightningModule):
@@ -279,7 +290,7 @@ class LightningDistributedTrainer:
             )
         ]
         
-        # Initialize the trainer
+        # Initialize the trainer with optimized settings
         self.trainer = pl.Trainer(
             max_epochs=epochs,
             accelerator=accelerator,
@@ -287,6 +298,11 @@ class LightningDistributedTrainer:
             log_every_n_steps=10,
             enable_progress_bar=True,
             enable_model_summary=True,
+            # Performance optimizations:
+            num_sanity_val_steps=0,  # Skip validation sanity checks
+            precision="32-true",     # Use native 32-bit precision rather than PyTorch Lightning's wrapper
+            deterministic=False,     # Disable deterministic mode for speed
+            benchmark=True,          # Enable CUDNN benchmarking for faster training
         )
 
     def parse_game_data(self, batch_data: List[Dict[str, Any]]) -> List[Tuple[np.ndarray, List[float], float]]:
@@ -361,21 +377,24 @@ class LightningDistributedTrainer:
             self.model.m
         ) if val_samples else None
         
-        # Create dataloaders
+        # Create dataloaders with optimized settings
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True if self.device == "cuda" else False
+            num_workers=min(self.num_workers, 2),  # Reduce num_workers to decrease startup time
+            pin_memory=True if self.device == "cuda" else False,
+            persistent_workers=self.num_workers > 0,  # Keep workers alive between epochs
+            prefetch_factor=2 if self.num_workers > 0 else None,  # Prefetch 2 batches per worker
         )
         
         val_loader = DataLoader(
             val_dataset,
-            batch_size=self.batch_size,
+            batch_size=self.batch_size*2,  # Use larger batch size for validation
             shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True if self.device == "cuda" else False
+            num_workers=min(self.num_workers, 1),  # Use fewer workers for validation
+            pin_memory=True if self.device == "cuda" else False,
+            persistent_workers=self.num_workers > 0,  # Keep workers alive between epochs
         ) if val_dataset else None
         
         return {
@@ -406,12 +425,19 @@ class LightningDistributedTrainer:
         # Prepare data
         data = self.prepare_data(samples)
         
-        # Train the model
+        # Track time to measure Lightning startup latency
+        train_start_time = time.time()
+        logger.info("Starting Lightning training process...")
+        
+        # Train the model with optimized settings
         self.trainer.fit(
             self.pl_model,
             train_dataloaders=data['train_loader'],
             val_dataloaders=data['val_loader']
         )
+        
+        train_duration = time.time() - train_start_time
+        logger.info(f"Lightning training complete in {train_duration:.2f} seconds")
         
         # Get training metrics
         metrics = {

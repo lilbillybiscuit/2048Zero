@@ -41,8 +41,8 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Global storage adapter instance
-storage_adapter: StorageAdapter = StorageAdapter({})
+# Define global storage adapter variable with proper type annotation
+storage_adapter: StorageAdapter = None
 
 # Add middleware
 app.add_middleware(
@@ -133,13 +133,14 @@ async def upload_games(request: Request, token: str = Depends(get_token_from_aut
             
             # Compare hashes
             if actual_hash != expected_hash:
-                logger.warning(f"SHA-256 hash mismatch: expected {expected_hash}, got {actual_hash}")
+                # logger.warning(f"SHA-256 hash mismatch: expected {expected_hash}, got {actual_hash}")
                 return JSONResponse(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     content={"detail": "Data integrity error: SHA-256 hash mismatch"}
                 )
             else:
-                logger.info("SHA-256 hash verified successfully")
+                pass
+                # logger.info("SHA-256 hash verified successfully")
         
         batch = json.loads(uncompressed_body)
         
@@ -203,6 +204,7 @@ def initialize_model(config):
     """Initialize model from scratch or checkpoint"""
     from zero.game import GameRules
     from zero.zeromodel import ZeroNetwork
+    global storage_adapter
 
     model_config = config.get("model", {})
     k_channels = model_config.get("k_channels", 16)
@@ -221,7 +223,13 @@ def initialize_model(config):
         blocks=blocks
     )
     
+    # Make sure storage adapter is initialized
+    if storage_adapter is None:
+        logger.error("Storage adapter not initialized before model initialization!")
+        raise RuntimeError("Storage adapter must be initialized before model")
+    
     # Save initial model using the storage adapter
+    logger.info("Saving initial model (revision 0)")
     weights_path, weights_url, weights_sha256 = storage_adapter.save_model(model, 0)
     
     # Update shared state
@@ -298,8 +306,12 @@ def main():
 
     shared_state.config = config
     
-    # Initialize storage adapter
-    storage_adapter = StorageAdapter(config)
+    # Initialize storage adapter only once
+    if storage_adapter is None:
+        logger.info("Initializing storage adapter for the first time")
+        storage_adapter = StorageAdapter(config)
+    else:
+        logger.warning("Storage adapter already initialized - this should not happen")
     
     # Reset if requested
     if config["reset"]:
@@ -331,7 +343,8 @@ def main():
         app,
         host=config["host"],
         port=config["port"],
-        log_level="info"
+        log_level="warning",
+        access_log=False
     )
 
 if __name__ == "__main__":
