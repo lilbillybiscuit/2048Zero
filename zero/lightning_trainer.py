@@ -307,6 +307,24 @@ class LightningDistributedTrainer:
                 
         # Configure wandb logger if available, fallback to CSV logger if not
         if WANDB_AVAILABLE:
+            # Extract model architecture details safely
+            model_config = {}
+            # Add common attributes first
+            if hasattr(self.model, 'n') and hasattr(self.model, 'm'):
+                model_config["board_size"] = f"{self.model.n}x{self.model.m}"
+            if hasattr(self.model, 'k'):
+                model_config["channels"] = self.model.k
+                
+            # Add architecture-specific attributes
+            if hasattr(self.model, 'filters'):
+                model_config["filters"] = self.model.filters
+            if hasattr(self.model, 'dense_out'):
+                model_config["dense_out"] = self.model.dense_out
+                
+            # For ZeroNetworkMain, get blocks count if it exists
+            if hasattr(self.model, 'blocks') and isinstance(self.model.blocks, list):
+                model_config["blocks"] = len(self.model.blocks)
+                
             # Create wandb logger with project and experiment tracking
             wandb_logger = WandbLogger(
                 project="2048-zero",
@@ -314,14 +332,15 @@ class LightningDistributedTrainer:
                 log_model="all",     # Log model checkpoints to wandb
                 save_dir="wandb_logs",
                 config={
+                    # Training parameters
                     "epochs": epochs,
                     "batch_size": self.batch_size,
                     "learning_rate": self.learning_rate,
-                    "model_filters": self.model.filters if hasattr(self.model, 'filters') else None,
-                    "model_blocks": len(self.model.blocks) if hasattr(self.model, 'blocks') else None,
                     "weight_decay": self.weight_decay,
                     "momentum": self.momentum,
-                    "board_size": f"{self.model.n}x{self.model.m}",
+                    "model_type": self.model.__class__.__name__,
+                    # Model architecture (added safely)
+                    **model_config
                 }
             )
             logger.info("Using Weights & Biases for experiment tracking")
