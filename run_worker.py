@@ -16,11 +16,17 @@ import logging
 import argparse
 import requests
 import io
+import warnings
 import torch
 import zstandard as zstd
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 
+# Filter out CUDA initialization warnings
+warnings.filterwarnings("ignore", 
+                        message="CUDA initialization: Unexpected error from cudaGetDeviceCount().*")
+
+# Import core components
 from zero import GameRules, GameState, BitBoard, ZeroNetwork, ZeroPlayer
 
 logging.basicConfig(
@@ -49,11 +55,15 @@ class Worker:
         self.batch_size = batch_size
         self.worker_id = str(uuid.uuid4())
         
-        # Set device
+        # Set device with strict enforcement
         if device:
+            # Ensure we use EXACTLY the device specified, with no auto-detection
             self.device = device
+            logger.debug(f"Using explicitly specified device: {self.device}")
         else:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            # Only auto-detect if no device was specified (shouldn't happen with launcher)
+            self.device = "cpu"  # Default to CPU instead of auto-detecting
+            logger.warning(f"No device specified, defaulting to CPU. This is unexpected.")
         
         # State tracking
         self.game_buffer = []
@@ -151,30 +161,52 @@ class Worker:
         return weights_data
     
     def load_model(self, weights_data: bytes, model_config: Dict[str, Any]):
-        """Load model from weights data"""
+        """Load model from weights data with robust error handling"""
         try:
+            # Log model configuration for debugging
+            logger.info(f"Creating model with config: height={self.rules.height}, width={self.rules.width}, "
+                       f"k_channels={model_config.get('k_channels')}, filters={model_config.get('filters', 128)}")
+            
             # Create model with configuration
             model = ZeroNetwork(
                 self.rules.height, 
                 self.rules.width,
-                model_config["k_channels"],
+                model_config.get("k_channels", 16),  # Default to 16 if not specified
                 filters=model_config.get("filters", 128),
                 blocks=model_config.get("blocks", 10)
             )
             
-            # Load weights directly from memory
-            buffer = io.BytesIO(weights_data)
-            state_dict = torch.load(buffer, map_location="cpu")
-            model.load_state_dict(state_dict)
-            
-            # Move to device and set to eval mode
-            model = model.to(self.device).eval()
-            
-            logger.info(f"Model loaded successfully to {self.device}")
-            return model
-            
+            # Load weights with robust error handling
+            try:
+                # First try to load directly to the target device
+                buffer = io.BytesIO(weights_data)
+                try:
+                    # Try loading directly to target device first
+                    state_dict = torch.load(buffer, map_location=self.device)
+                except RuntimeError:
+                    # If that fails, load to CPU first
+                    buffer.seek(0)  # Reset buffer position
+                    logger.warning(f"Loading to {self.device} failed, trying CPU first")
+                    state_dict = torch.load(buffer, map_location="cpu")
+                
+                # Load state dict
+                model.load_state_dict(state_dict)
+                
+                # Move model to device and set to eval mode
+                model = model.to(self.device)
+                model.eval()
+                
+                # Verify the model is on the correct device
+                param_device = next(model.parameters()).device
+                logger.info(f"Model loaded successfully to {param_device} (requested: {self.device})")
+                
+                return model
+            except Exception as e:
+                logger.exception(f"Error loading model weights: {e}")
+                return None
+                
         except Exception as e:
-            logger.exception(f"Failed to load model: {e}")
+            logger.exception(f"Failed to create or load model: {e}")
             return None
     
     def play_game(self, model: ZeroNetwork, self_play_config: Dict[str, Any]):
@@ -385,13 +417,53 @@ def main():
     
     args = parser.parse_args()
 
-    # if there are multiple GPUs and/or accelerator is set to cuda, set the device to the PID modulo the number of GPUs
-    if args.device == "cuda" or torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        if num_gpus > 1:
-            args.device = f"cuda:{os.getpid() % num_gpus}"
+    # More robust GPU device selection with error handling
+    try:
+        if args.device == "cuda":
+            # User explicitly requested CUDA
+            try:
+                num_gpus = torch.cuda.device_count()
+                if num_gpus > 0:
+                    if num_gpus > 1:
+                        # Multiple GPUs available, use PID for round-robin assignment
+                        args.device = f"cuda:{os.getpid() % num_gpus}"
+                    else:
+                        # Only one GPU
+                        args.device = "cuda:0"
+                else:
+                    # No GPUs available even though CUDA requested
+                    print("Warning: CUDA requested but no GPUs detected, falling back to CPU")
+                    args.device = "cpu"
+            except Exception as e:
+                # Error with CUDA initialization, fallback to CPU
+                print(f"Warning: CUDA error: {e}, falling back to CPU")
+                args.device = "cpu"
+        elif torch.cuda.is_available():
+            # Auto-detect CUDA if available
+            try:
+                num_gpus = torch.cuda.device_count()
+                if num_gpus > 1:
+                    # Multiple GPUs available, use PID for round-robin assignment
+                    args.device = f"cuda:{os.getpid() % num_gpus}"
+                else:
+                    # Only one GPU
+                    args.device = "cuda:0"
+            except Exception as e:
+                # CUDA available but error during initialization
+                print(f"Warning: CUDA initialization error: {e}, using CPU instead")
+                args.device = "cpu"
+        elif hasattr(torch, "has_mps") and torch.has_mps:  # PyTorch 2.0+ for Mac M1/M2
+            # Use MPS (Metal Performance Shaders) on Mac with Apple Silicon
+            args.device = "mps"
         else:
-            args.device = "cuda"
+            # Default to CPU if no GPU available
+            args.device = "cpu"
+    except Exception as e:
+        # Fallback for any unexpected errors
+        print(f"Warning: Error during device detection: {e}, falling back to CPU")
+        args.device = "cpu"
+        
+    print(f"Selected device: {args.device}")
     
     # Create and run worker
     worker = Worker(
