@@ -177,4 +177,4 @@ class ZeroNetworkMini(ZeroNetworkMain):
         return policy_out, value_out
 
 
-ZeroNetwork = ZeroNetworkMain
+ZeroNetwork = ZeroNetworkMini
