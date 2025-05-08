@@ -266,7 +266,7 @@ if __name__ == "__main__":
     avg_score1, results1 = run_random_game(rules)
     avg_score2, results2 = run_max_heurisic_games(rules)
     avg_score3, results3 = run_bitboard_games(rounds=100, depth=3)
-    avg_score4, results4 = run_zero_games(weights_path="weights/r0.pt", num_games=100, num_simulations=50)
+    # avg_score4, results4 = run_zero_games(weights_path="weights/r0.pt", num_games=100, num_simulations=50)
 
     # print results
     print("\nRandom Game Results:")
